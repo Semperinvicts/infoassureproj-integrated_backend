@@ -1,0 +1,33 @@
+{
+  "name": "infoassureproj",
+  "version": "1.0.0",
+  "description": "info assurance final project",
+  "homepage": "https://github.com/Semperinvicts/infoassureproj#readme",
+  "bugs": {
+    "url": "https://github.com/Semperinvicts/infoassureproj/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Semperinvicts/infoassureproj.git"
+  },
+  "license": "ISC",
+  "author": "team kaboom",
+  "type": "commonjs",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js",
+    "dev": "node --watch app.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.105.1",
+    "body-parser": "^2.2.2",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "express-rate-limit": "^7.5.0",
+    "fs": "^0.0.1-security",
+    "helmet": "^8.0.0",
+    "path": "^0.12.7"
+  }
+}
