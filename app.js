@@ -105,15 +105,19 @@ app.use(helmet({
         directives: {
             defaultSrc    : ["'self'"],
             scriptSrc     : ["'self'", "https://js.hcaptcha.com", "'unsafe-inline'"],
-            scriptSrcAttr : ["'unsafe-inline'"], // <-- Added to fix onclick handlers
+            scriptSrcAttr : ["'unsafe-inline'"],
             frameSrc      : [
                 "https://www.youtube-nocookie.com",
                 "https://newassets.hcaptcha.com"
             ],
-            connectSrc    : ["'self'", SUPABASE_URL],
+            // Added hcaptcha domains to allow background checks
+            connectSrc    : ["'self'", SUPABASE_URL, "https://*.hcaptcha.com"], 
             styleSrc      : ["'self'", "https://fonts.googleapis.com", "'unsafe-inline'"],
-            fontSrc       : ["https://fonts.gstatic.com", "data:"], // <-- Added to fix fonts
-            imgSrc        : ["'self'", "data:"],
+            fontSrc       : ["https://fonts.gstatic.com", "data:"],
+            // Added hcaptcha domains to allow widget images
+            imgSrc        : ["'self'", "data:", "https://*.hcaptcha.com"], 
+            // Added formAction to allow SSO redirects to Supabase, Google, and Apple
+            formAction    : ["'self'", SUPABASE_URL, "https://accounts.google.com", "https://appleid.apple.com"], 
             objectSrc     : ["'none'"],
             baseUri       : ["'self'"],
             frameAncestors: ["'none'"]
