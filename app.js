@@ -30,6 +30,12 @@ if (!HCAPTCHA_SITE_KEY) {
 }
 
 const app      = express();
+app.use((req, res, next) => {
+    if (req.method === 'OPTIONS') {
+        return res.status(405).send('Method Not Allowed');
+    }
+    next();
+});
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -109,21 +115,17 @@ app.use(helmet({
     contentSecurityPolicy: {
         directives: {
             defaultSrc    : ["'self'"],
-            // FIX: hCaptcha script is now proxied via /hcaptcha-api.js (same-origin),
-            // so https://js.hcaptcha.com is no longer needed in scriptSrc.
-            scriptSrc     : ["'self'", "https://js.hcaptcha.com", "'unsafe-inline'"],
-            scriptSrcAttr : ["'unsafe-inline'"],
+            // Removed 'unsafe-inline' from scripts
+            scriptSrc     : ["'self'"], 
+            scriptSrcAttr : ["'none'"], 
             frameSrc      : [
                 "https://www.youtube-nocookie.com",
                 "https://newassets.hcaptcha.com"
             ],
-            // Added hcaptcha domains to allow background checks
             connectSrc    : ["'self'", SUPABASE_URL, "https://*.hcaptcha.com"], 
             styleSrc      : ["'self'", "https://fonts.googleapis.com", "'unsafe-inline'"],
             fontSrc       : ["https://fonts.gstatic.com", "data:"],
-            // Added hcaptcha domains to allow widget images
             imgSrc        : ["'self'", "data:", "https://*.hcaptcha.com"], 
-            // Added formAction to allow SSO redirects to Supabase, Google, and Apple
             formAction    : ["'self'", SUPABASE_URL, "https://accounts.google.com", "https://appleid.apple.com"], 
             objectSrc     : ["'none'"],
             baseUri       : ["'self'"],
