@@ -99,25 +99,25 @@ const asyncHandler = fn => (req, res, next) =>
     Promise.resolve(fn(req, res, next)).catch(next);
 
 // Helmet — security headers with explicit CSP (REC-01).
-// No inline scripts remain, so no nonce is required.
+// 'unsafe-inline' removed from scriptSrc — all onclick/oninput handlers have
+// been moved to addEventListener calls in script.js and dashboard.js instead.
+// styleSrc retains 'unsafe-inline' because hCaptcha injects inline styles into
+// its widget iframe — removing it breaks the captcha widget rendering.
 app.use(helmet({
     contentSecurityPolicy: {
         directives: {
             defaultSrc    : ["'self'"],
-            scriptSrc     : ["'self'", "https://js.hcaptcha.com", "'unsafe-inline'"],
-            scriptSrcAttr : ["'unsafe-inline'"],
+            scriptSrc     : ["'self'", "https://js.hcaptcha.com"],
+            // scriptSrcAttr omitted — no inline event handlers remain in HTML.
             frameSrc      : [
                 "https://www.youtube-nocookie.com",
                 "https://newassets.hcaptcha.com"
             ],
-            // Added hcaptcha domains to allow background checks
-            connectSrc    : ["'self'", SUPABASE_URL, "https://*.hcaptcha.com"], 
+            connectSrc    : ["'self'", SUPABASE_URL, "https://*.hcaptcha.com"],
             styleSrc      : ["'self'", "https://fonts.googleapis.com", "'unsafe-inline'"],
             fontSrc       : ["https://fonts.gstatic.com", "data:"],
-            // Added hcaptcha domains to allow widget images
-            imgSrc        : ["'self'", "data:", "https://*.hcaptcha.com"], 
-            // Added formAction to allow SSO redirects to Supabase, Google, and Apple
-            formAction    : ["'self'", SUPABASE_URL, "https://accounts.google.com", "https://appleid.apple.com"], 
+            imgSrc        : ["'self'", "data:", "https://*.hcaptcha.com"],
+            formAction    : ["'self'", SUPABASE_URL, "https://accounts.google.com", "https://appleid.apple.com"],
             objectSrc     : ["'none'"],
             baseUri       : ["'self'"],
             frameAncestors: ["'none'"]

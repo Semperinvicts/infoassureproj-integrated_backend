@@ -327,6 +327,7 @@ function initLoginForm() {
 
             // ── Real server-side failure → trigger attempt UI ─────────────────
             attempts++;
+            sessionStorage.setItem('loginAttempts', String(attempts)); // survive reload
             const dot = document.getElementById('dot' + attempts);
             if (dot) dot.classList.add('used');
 
@@ -361,6 +362,7 @@ function initLoginForm() {
 
 function triggerAngry() {
     isAngry = true;
+    sessionStorage.setItem('loginAttempts', String(attempts)); // persist across reloads
     body.classList.add('angry');
     leftPanel.classList.add('angry-mode');
     browL.setAttribute('d', 'M 20,5 Q 90,12 160,20');
@@ -376,6 +378,7 @@ function triggerAngry() {
 function resetAngry() {
     isAngry  = false;
     attempts = 0;
+    sessionStorage.removeItem('loginAttempts'); // clear persisted lockout
     body.classList.remove('angry');
     leftPanel.classList.remove('angry-mode');
     browL.setAttribute('d', 'M 20,16 Q 90,16 160,16');
@@ -435,11 +438,63 @@ document.addEventListener('mousemove', (e) => {
 // ── Init ───────────────────────────────────────────────────────────────────────
 
 document.addEventListener('DOMContentLoaded', () => {
+
+    // ── Wire tab buttons (replaces onclick= in HTML) ──────────────────────────
+    const tabSignup = document.getElementById('tabSignup');
+    const tabSignin = document.getElementById('tabSignin');
+    if (tabSignup) tabSignup.addEventListener('click', () => switchTab('signup'));
+    if (tabSignin) tabSignin.addEventListener('click', () => switchTab('signin'));
+
+    // ── Wire switch-row links (replaces onclick= in HTML) ─────────────────────
+    const linkToSignin = document.getElementById('linkToSignin');
+    const linkToSignup = document.getElementById('linkToSignup');
+    if (linkToSignin) linkToSignin.addEventListener('click', () => switchTab('signin'));
+    if (linkToSignup) linkToSignup.addEventListener('click', () => switchTab('signup'));
+
+    // ── Wire password complexity checker (replaces oninput= in HTML) ──────────
+    const suPassword = document.getElementById('suPassword');
+    if (suPassword) suPassword.addEventListener('input', () => checkPwComplexity(suPassword.value));
+
+    // ── Wire password visibility toggle (replaces onclick= in HTML) ───────────
+    const pwToggleBtn = document.getElementById('pwToggleBtn');
+    if (pwToggleBtn) {
+        // Inject the default eye SVG that was previously inline in the HTML.
+        pwToggleBtn.innerHTML = '<svg class="eye-icon" xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>';
+        pwToggleBtn.addEventListener('click', () => togglePwVisibility('siPassword', pwToggleBtn));
+    }
+
+    // ── Wire logout button in dashboard pages (replaces onclick= in HTML) ─────
+    const logoutBtn = document.getElementById('logoutBtn');
+    if (logoutBtn) logoutBtn.addEventListener('click', () => { window.location.href = '/logout'; });
+
     if (document.getElementById('tabSignup')) {
         switchTab('signin');
         if (errMsg) errMsg.style.display = 'none';
-        initSignupForm();   
-        initLoginForm();    
+        initSignupForm();
+        initLoginForm();
     }
-    fetchConfig(); 
+
+    fetchConfig();
+
+    // ── REM-3 FIX: Server-side lockout check on page load ────────────────────
+    // After 3 failed attempts the server rate-limiter is the real enforcement,
+    // but the UI lockout (triggerAngry) can be bypassed by reloading the page,
+    // resetting the client-side `attempts` counter to 0.
+    // On DOMContentLoaded we check how many attempts the server has already
+    // recorded by probing /login with a dummy OPTIONS-like HEAD call — but
+    // the cleanest approach without a dedicated endpoint is to persist the
+    // attempt count in sessionStorage so a page reload can't reset it.
+    const stored = parseInt(sessionStorage.getItem('loginAttempts') || '0', 10);
+    if (stored >= 3) {
+        // Restore the locked UI without re-counting any attempts.
+        attempts = stored;
+        triggerAngry();
+    } else {
+        attempts = stored;
+        // Restore any previously used dots.
+        for (let i = 1; i <= stored; i++) {
+            const dot = document.getElementById('dot' + i);
+            if (dot) dot.classList.add('used');
+        }
+    }
 });
