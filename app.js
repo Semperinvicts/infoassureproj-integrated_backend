@@ -347,7 +347,7 @@ app.post("/login", loginLimiter, asyncHandler(async (req, res) => {
 app.post("/googleSSO", asyncHandler(async (req, res) => {
     const { data, error } = await supabase.auth.signInWithOAuth({
         provider : "google",
-        options  : { redirectTo: `${APP_BASE_URL}/callback` }
+        options  : { redirectTo: "https://infoassureproj-integrated-backend.onrender.com/callback" }
     });
 
     if (error || !data?.url) {
