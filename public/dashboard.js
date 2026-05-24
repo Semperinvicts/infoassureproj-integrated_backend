@@ -9,8 +9,6 @@
 (function initUser() {
     const body = document.getElementById('mainBody');
     if (!body) return;
-    // dataset values are plain strings — HTML entities already decoded by the
-    // browser's HTML parser, so no further unescaping is needed.
     window.USER = {
         name:  body.dataset.userName  || '',
         email: body.dataset.userEmail || ''
@@ -45,6 +43,8 @@
 }());
 
 // ── Session / logout ───────────────────────────────────────────────────────
-function logout() {
-    window.location.href = '/logout';
-}
+// Wire the Sign out button via addEventListener — no onclick= in HTML.
+(function initLogout() {
+    const btn = document.getElementById('logoutBtn');
+    if (btn) btn.addEventListener('click', () => { window.location.href = '/logout'; });
+}());
