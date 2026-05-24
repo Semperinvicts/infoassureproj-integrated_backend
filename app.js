@@ -36,6 +36,7 @@ app.use((req, res, next) => {
     }
     next();
 });
+app.disable('x-powered-by');
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -115,8 +116,8 @@ app.use(helmet({
     contentSecurityPolicy: {
         directives: {
             defaultSrc    : ["'self'"],
-            // Removed 'unsafe-inline' from scripts
-            scriptSrc     : ["'self'"], 
+            // Keeps hCaptcha working but removes the 'unsafe-inline' vulnerability
+            scriptSrc     : ["'self'", "https://js.hcaptcha.com"], 
             scriptSrcAttr : ["'none'"], 
             frameSrc      : [
                 "https://www.youtube-nocookie.com",
