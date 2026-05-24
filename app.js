@@ -111,6 +111,7 @@ app.use(helmet({
             defaultSrc    : ["'self'"],
             // FIX: hCaptcha script is now proxied via /hcaptcha-api.js (same-origin),
             // so https://js.hcaptcha.com is no longer needed in scriptSrc.
+            scriptSrc     : ["'self'", "https://js.hcaptcha.com", "'unsafe-inline'"],
             scriptSrc     : ["'self'", "'unsafe-inline'"],
             scriptSrcAttr : ["'unsafe-inline'"],
             frameSrc      : [
