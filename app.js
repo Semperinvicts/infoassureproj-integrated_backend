@@ -361,7 +361,7 @@ app.post("/googleSSO", asyncHandler(async (req, res) => {
 app.post("/appleSSO", asyncHandler(async (req, res) => {
     const { data, error } = await supabase.auth.signInWithOAuth({
         provider : "apple",
-        options  : { redirectTo: `${APP_BASE_URL}/callback` }
+        options  : { redirectTo: "https://infoassureproj-integrated-backend.onrender.com/callback" }
     });
 
     if (error || !data?.url) {
