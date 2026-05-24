@@ -224,7 +224,20 @@
     }
   </style>
 </head>
-<body id="mainBody" class="dashboard-mode" data-user-name={{js_name}} data-user-email={{js_email}}>
+<!--
+    FIX: Unquoted data attributes
+    ────────────────────────────────────────────────────────────────────────────
+    BEFORE: data-user-name={{js_name}}  ← unquoted; JSON.stringify adds "..."
+            but a name containing " (e.g. O'Brien or Jo "Smith") breaks
+            the HTML attribute boundary.
+
+    AFTER:  data-user-name="{{name}}"   ← always double-quoted in HTML;
+            {{name}} is replaced by escapeHtml() which converts " → &quot;
+            so attribute syntax is never broken regardless of user input.
+            dataset.userName in dashboard.js receives the decoded value
+            automatically (HTML entities are decoded on .dataset access).
+-->
+<body id="mainBody" class="dashboard-mode" data-user-name="{{name}}" data-user-email="{{email}}">
 
   <header class="topbar">
     <span class="topbar-brand">CSCN08C</span>

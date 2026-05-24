@@ -255,7 +255,11 @@
     }
   </style>
 </head>
-<body id="mainBody" class="dashboard-mode" data-user-name={{js_name}} data-user-email={{js_email}}>
+<!--
+    FIX: Unquoted data attributes — same reasoning as private.html.
+    {{name}} and {{email}} use escapeHtml(); attributes are always double-quoted.
+-->
+<body id="mainBody" class="dashboard-mode" data-user-name="{{name}}" data-user-email="{{email}}">
 
   <header class="topbar">
     <span class="topbar-brand">CSCN08C</span>
