@@ -559,3 +559,13 @@ body.angry .eyelid-bottom { background: #0a0000; }
     .success-split .right { display: none; }
     .success-split .left  { flex: 1; padding: 40px 28px; }
 }
+/* ── SSO form wrappers (replaces inline style="flex:1" removed for CSP) ── */
+.sso-form {
+  flex: 1;
+  display: flex;
+}
+
+.sso-form .btn-social {
+  width: 100%;
+  flex: 1;
+}

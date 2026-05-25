@@ -52,11 +52,14 @@
     if (!btn) return;
     btn.addEventListener('click', async () => {
         try {
-            const resp = await fetch('/logout', { method: 'POST' });
-            // Follow the server's redirect (302 → /) regardless of response body.
-            window.location.replace(resp.url || '/');
-        } catch (err) {
-            // Network error — fall back to direct navigation.
+            // POST to /logout — server clears the cookie and returns 302.
+            // We ignore resp.url because on some hosts (e.g. Render) the
+            // redirect URL resolves back to /logout. Always navigate to / directly.
+            await fetch('/logout', { method: 'POST', redirect: 'manual' });
+        } catch (_) {
+            // Network error is fine — the server already cleared the cookie.
+        } finally {
+            // Always send the browser to the login page regardless of network result.
             window.location.replace('/');
         }
     });

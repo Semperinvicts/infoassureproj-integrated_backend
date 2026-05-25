@@ -126,7 +126,7 @@ app.use(helmet({
             // @import in the <link> tags (VUL-F05 acknowledged — self-hosting
             // fonts is the long-term fix).
             styleSrc      : ["'self'", "https://fonts.googleapis.com"],
-            fontSrc       : ["'self'", "https://fonts.gstatic.com", "data:"],
+            fontSrc       : ["'self'", "https://fonts.gstatic.com", "data:", "https://fonts.googleapis.com"],
             frameSrc      : [
                 "https://www.youtube-nocookie.com",
                 "https://newassets.hcaptcha.com"
@@ -469,6 +469,21 @@ app.get("/success", (req, res) => {
 // defence-in-depth layer: cross-site POST requests also cannot attach it.
 // ─────────────────────────────────────────────────────────────────────────────
 app.post("/logout", (req, res) => {
+    res.clearCookie("access_token", {
+        httpOnly : true,
+        secure   : IS_PROD,
+        sameSite : "strict",
+        path     : "/"
+    });
+    // Respond with 200 + JSON instead of 302 so fetch() with redirect:'manual'
+    // gets a real response instead of an opaque redirect that some proxies mangle.
+    res.json({ ok: true });
+});
+
+// GET /logout — safety fallback for direct browser navigation / stale bookmarks.
+// Clears the cookie and redirects to login. Not the primary logout path
+// (that is POST /logout via dashboard.js fetch) but prevents "Cannot GET /logout".
+app.get("/logout", (req, res) => {
     res.clearCookie("access_token", {
         httpOnly : true,
         secure   : IS_PROD,

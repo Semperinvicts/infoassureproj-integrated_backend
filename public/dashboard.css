@@ -261,3 +261,28 @@ body {
   .iris-wrap { width: 28px; height: 28px; }
   .pupil     { width: 12px; height: 12px; }
 }
+/* ── SSO button full-width fix ── */
+/* The .social-row forms are flex children but the buttons inside need an
+   explicit width to fill their container on all browsers. */
+.social-row form {
+  flex: 1;
+  display: flex;
+}
+
+.social-row .btn-social {
+  width: 100%;
+  flex: 1;
+}
+
+/* ── Reward image fill fix ── */
+/* The inline style on the <img> was blocked by CSP (no unsafe-inline in
+   style-src). These rules replicate that layout via an external stylesheet. */
+.reward-img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border: none;
+  display: block;
+}
