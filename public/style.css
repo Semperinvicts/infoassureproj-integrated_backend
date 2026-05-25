@@ -372,3 +372,190 @@ body.angry .eyelid-bottom { background: #0a0000; }
   100% { transform:translateX(0); }
 }
 .panel-shake { animation: panelShake 0.5s ease; }
+/* ═══════════════════════════════════════════════════════════════════════════
+ * FIX — CSP: Style-Src Unsafe-Inline
+ * The following blocks were previously inline <style> elements in
+ * Frontend.html and success.html. Moving them here removes the need for
+ * 'unsafe-inline' in the Content-Security-Policy styleSrc directive.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── Frontend.html extras (login / signup page) ─────────────────────────── */
+.pw-input-wrap { position: relative; display: flex; align-items: center; }
+.pw-input-wrap input { width: 100%; padding-right: 2.6rem; box-sizing: border-box; }
+.pw-toggle {
+    position: absolute; right: 0.7rem;
+    background: none; border: none; cursor: pointer;
+    color: #888; padding: 0; display: flex; align-items: center;
+    transition: color 0.2s;
+}
+.pw-toggle:hover { color: #333; }
+
+.captcha-wrap { margin: 14px 0 4px; }
+
+/* Shown when user submits without completing the hCaptcha widget */
+.captcha-error {
+    display: none;
+    font-size: 0.77rem;
+    color: #c0392b;
+    margin: 4px 0 10px;
+}
+
+/* General server-level error message (e.g. "email already registered") */
+.form-error {
+    display: none;
+    font-size: 0.82rem;
+    color: #c0392b;
+    background: #fff0f0;
+    border: 1.5px solid #f5c6c6;
+    border-radius: 6px;
+    padding: 9px 12px;
+    margin: 10px 0;
+}
+
+/* ── success.html page styles ────────────────────────────────────────────── */
+.success-split {
+    display: flex;
+    width: 100%;
+    height: 100vh;
+}
+
+.envelope-wrap {
+    margin-bottom: 32px;
+    opacity: 0;
+    transform: translateY(10px);
+    animation: rise 0.55s cubic-bezier(0.22, 1, 0.36, 1) 0.1s forwards;
+}
+
+.step-label {
+    font-size: 0.75rem;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: #3d6b35;
+    margin-bottom: 12px;
+    opacity: 0;
+    animation: rise 0.5s cubic-bezier(0.22, 1, 0.36, 1) 0.2s forwards;
+}
+
+.rule {
+    width: 36px;
+    height: 2px;
+    background: #3d6b35;
+    border-radius: 2px;
+    margin-bottom: 20px;
+    opacity: 0;
+    animation: rise 0.5s cubic-bezier(0.22, 1, 0.36, 1) 0.35s forwards;
+}
+
+.body-text {
+    font-size: 0.9rem;
+    line-height: 1.7;
+    color: #555;
+    margin-bottom: 0;
+    opacity: 0;
+    animation: rise 0.55s cubic-bezier(0.22, 1, 0.36, 1) 0.4s forwards;
+}
+
+.hint-box {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: #f4f8f3;
+    border: 1.5px solid #c8dfc4;
+    border-radius: 8px;
+    padding: 12px 16px;
+    font-size: 0.82rem;
+    color: #3d6b35;
+    font-weight: 500;
+    margin: 22px 0;
+    opacity: 0;
+    animation: rise 0.55s cubic-bezier(0.22, 1, 0.36, 1) 0.48s forwards;
+}
+
+.actions {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    opacity: 0;
+    animation: rise 0.55s cubic-bezier(0.22, 1, 0.36, 1) 0.56s forwards;
+}
+
+.switch-row button {
+    background: none;
+    border: none;
+    color: #3d6b35;
+    font-family: 'DM Sans', sans-serif;
+    font-size: 0.87rem;
+    font-weight: 600;
+    cursor: pointer;
+    padding: 0;
+}
+
+.switch-row button:hover { text-decoration: underline; }
+
+.right-content {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 40px;
+}
+
+.right-eyebrow {
+    font-family: 'Playfair Display', serif;
+    font-size: 1rem;
+    color: rgba(255,255,255,0.7);
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    margin-bottom: 16px;
+}
+
+.right-heading {
+    font-family: 'Playfair Display', serif;
+    font-size: 2rem;
+    font-weight: 700;
+    color: #fff;
+    line-height: 1.2;
+    margin-bottom: 20px;
+}
+
+.right-body {
+    font-size: 0.9rem;
+    color: rgba(255,255,255,0.75);
+    line-height: 1.7;
+    max-width: 300px;
+}
+
+.check-circle {
+    width: 72px;
+    height: 72px;
+    border-radius: 50%;
+    background: rgba(255,255,255,0.15);
+    border: 2px solid rgba(255,255,255,0.4);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin: 0 auto 28px;
+}
+
+@keyframes rise {
+    to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes draw-check {
+    to { stroke-dashoffset: 0; }
+}
+
+.check-path {
+    stroke-dasharray: 40;
+    stroke-dashoffset: 40;
+    animation: draw-check 0.5s cubic-bezier(0.22, 1, 0.36, 1) 0.7s forwards;
+}
+
+@media (max-width: 768px) {
+    .success-split .right { display: none; }
+    .success-split .left  { flex: 1; padding: 40px 28px; }
+}

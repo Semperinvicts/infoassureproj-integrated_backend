@@ -111,26 +111,47 @@ const asyncHandler = fn => (req, res, next) =>
     Promise.resolve(fn(req, res, next)).catch(next);
 
 // Helmet — security headers with explicit CSP (REC-01).
-// No inline scripts remain, so no nonce is required.
+// All inline <style> blocks have been moved to external CSS files (dashboard.css,
+// style.css) so 'unsafe-inline' is no longer needed in styleSrc.
 app.use(helmet({
     contentSecurityPolicy: {
         directives: {
             defaultSrc    : ["'self'"],
-            // Keeps hCaptcha working but removes the 'unsafe-inline' vulnerability
-            scriptSrc     : ["'self'", "https://js.hcaptcha.com"], 
-            scriptSrcAttr : ["'none'"], 
+            scriptSrc     : ["'self'", "https://js.hcaptcha.com"],
+            scriptSrcAttr : ["'none'"],
+            // FIX — CSP: Style-Src Unsafe-Inline
+            // 'unsafe-inline' removed. All page-specific styles are now in
+            // external .css files served from 'self', so the browser accepts
+            // them without unsafe-inline. Google Fonts is still needed for the
+            // @import in the <link> tags (VUL-F05 acknowledged — self-hosting
+            // fonts is the long-term fix).
+            styleSrc      : ["'self'", "https://fonts.googleapis.com"],
+            fontSrc       : ["'self'", "https://fonts.gstatic.com", "data:"],
             frameSrc      : [
                 "https://www.youtube-nocookie.com",
                 "https://newassets.hcaptcha.com"
             ],
-            connectSrc    : ["'self'", SUPABASE_URL, "https://*.hcaptcha.com"], 
-            styleSrc      : ["'self'", "https://fonts.googleapis.com", "'unsafe-inline'"],
-            fontSrc       : ["https://fonts.gstatic.com", "data:"],
-            imgSrc        : ["'self'", "data:", "https://*.hcaptcha.com"], 
-            formAction    : ["'self'", SUPABASE_URL, "https://accounts.google.com", "https://appleid.apple.com"], 
+            connectSrc    : ["'self'", SUPABASE_URL, "https://*.hcaptcha.com"],
+            imgSrc        : ["'self'", "data:", "https://*.hcaptcha.com"],
+            // FIX — CSP: Failure To Define Directive With No Fallback
+            // mediaSrc and workerSrc do fall back to defaultSrc/scriptSrc in
+            // the spec, but being explicit stops scanners flagging the
+            // omission and prevents unexpected future fallback behaviour.
+            mediaSrc      : ["'none'"],
+            workerSrc     : ["'none'"],
+            formAction    : ["'self'", SUPABASE_URL, "https://accounts.google.com", "https://appleid.apple.com"],
             objectSrc     : ["'none'"],
             baseUri       : ["'self'"],
-            frameAncestors: ["'none'"]
+            frameAncestors: ["'none'"],
+            // FIX — Absence of Anti-CSRF Tokens (partial)
+            // The primary CSRF vector (GET logout) is closed by converting
+            // /logout to POST (VUL-F02). The login/signup forms submit via
+            // fetch() — not native form POST — so no hidden CSRF token field
+            // is required. SameSite=Strict on session cookies blocks cross-
+            // site requests from attaching the session cookie at all.
+            // upgradeInsecureRequests is enabled in production via IS_PROD
+            // secure cookie flag; explicit directive left out to allow local
+            // HTTP dev without constant browser errors.
         }
     }
 }));
@@ -434,11 +455,20 @@ app.get("/success", (req, res) => {
     res.sendFile(path.join(__dirname, "public", "success.html"));
 });
 
-app.get("/logout", (req, res) => {
-    // clearCookie MUST pass the same httpOnly/secure/sameSite attributes
-    // that were used when the cookie was set, otherwise the browser treats
-    // it as a different cookie and the original survives — causing the
-    // "sign out does nothing" bug.
+// ─────────────────────────────────────────────────────────────────────────────
+// VUL-F02 FIX — /logout converted from GET to POST.
+//
+// WHY: HTTP GET must not trigger state changes (RFC 9110 §9.3.1). A GET-based
+// logout lets any page force a victim to log out by embedding:
+//   <img src="https://target/logout">
+// Even with SameSite=Strict cookies, this is a design violation.
+//
+// FIX: POST + dashboard.js fires fetch('/logout', {method:'POST'}) so no
+// navigation or form is required, and the browser never attaches the cookie
+// to a cross-site GET request. The SameSite=Strict cookie provides the
+// defence-in-depth layer: cross-site POST requests also cannot attach it.
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/logout", (req, res) => {
     res.clearCookie("access_token", {
         httpOnly : true,
         secure   : IS_PROD,

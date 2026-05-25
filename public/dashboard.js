@@ -43,8 +43,21 @@
 }());
 
 // ── Session / logout ───────────────────────────────────────────────────────
-// Wire the Sign out button via addEventListener — no onclick= in HTML.
+// VUL-F02 FIX: logout fires a POST request instead of navigating to GET /logout.
+// Using fetch() means the browser never sends a GET to /logout, so a crafted
+// <img src="/logout"> on a third-party page cannot force a session termination.
+// On success the server redirects to /, which window.location.replace() follows.
 (function initLogout() {
     const btn = document.getElementById('logoutBtn');
-    if (btn) btn.addEventListener('click', () => { window.location.href = '/logout'; });
+    if (!btn) return;
+    btn.addEventListener('click', async () => {
+        try {
+            const resp = await fetch('/logout', { method: 'POST' });
+            // Follow the server's redirect (302 → /) regardless of response body.
+            window.location.replace(resp.url || '/');
+        } catch (err) {
+            // Network error — fall back to direct navigation.
+            window.location.replace('/');
+        }
+    });
 }());
