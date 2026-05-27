@@ -451,7 +451,7 @@ app.post("/login", loginLimiter, loginSlowDown, asyncHandler(async (req, res) =>
 app.post("/googleSSO", ssoLimiter, asyncHandler(async (req, res) => {
     const { data, error } = await supabase.auth.signInWithOAuth({
         provider : "google",
-        options  : { redirectTo: "https://infoassureproj-integrated-backend.onrender.com/callback" }
+        options  : { redirectTo: "https://infoassureproj-integratedbackend-production.up.railway.app/callback" }
     });
 
     if (error || !data?.url) {
@@ -465,7 +465,7 @@ app.post("/googleSSO", ssoLimiter, asyncHandler(async (req, res) => {
 app.post("/appleSSO", ssoLimiter, asyncHandler(async (req, res) => {
     const { data, error } = await supabase.auth.signInWithOAuth({
         provider : "apple",
-        options  : { redirectTo: "https://infoassureproj-integrated-backend.onrender.com/callback" }
+        options  : { redirectTo: "https://infoassureproj-integratedbackend-production.up.railway.app/callback" }
     });
 
     if (error || !data?.url) {
