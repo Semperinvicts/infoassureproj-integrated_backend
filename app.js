@@ -6,6 +6,7 @@ const path         = require("path");
 const fs           = require("fs");
 const https        = require("https");        // used by hCaptcha proxy
 const rateLimit    = require("express-rate-limit");
+const slowDown     = require("express-slow-down");
 const helmet       = require("helmet");
 const { createClient } = require("@supabase/supabase-js");
 
@@ -190,10 +191,92 @@ const setCookieLimiter = rateLimit({
     legacyHeaders   : false
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ANTI-DDOS: Global rate limiter — catches every route not protected by a
+// tighter per-route limiter above.
+//
+// 300 requests / 15 min per IP is generous enough for real users (a full page
+// load with assets is ~5-8 requests) but stops simple volumetric floods and
+// scanners that rotate through every endpoint.
+//
+// Static files served by express.static() bypass this because static() runs
+// before app.use(globalLimiter) — that is intentional: static assets are cheap
+// and CDN-cacheable. If you add a CDN (Cloudflare, etc.) in front of Render,
+// static file floods are absorbed before they reach Node.
+// ─────────────────────────────────────────────────────────────────────────────
+const globalLimiter = rateLimit({
+    windowMs        : 15 * 60 * 1000,  // 15-minute window
+    max             : 300,              // 300 requests per window per IP
+    standardHeaders : true,
+    legacyHeaders   : false,
+    message         : { error: "Too many requests. Please slow down and try again later." }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ANTI-DDOS: SSO rate limiter — fixes audit finding NEW-06.
+// OAuth initiation is lightweight on our side (one Supabase API call) but
+// hammering it generates hundreds of authorization URLs per minute.
+// ─────────────────────────────────────────────────────────────────────────────
+const ssoLimiter = rateLimit({
+    windowMs        : 60 * 1000,       // 1-minute window
+    max             : 10,              // 10 SSO attempts per minute per IP
+    standardHeaders : true,
+    legacyHeaders   : false,
+    message         : { error: "Too many sign-in attempts. Please wait a moment." }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ANTI-DDOS: hCaptcha proxy rate limiter.
+// The proxy endpoint fetches from hCaptcha's CDN (cached hourly) but the
+// endpoint itself can be hit repeatedly. Limit to 60/min — one per page load
+// with room for retries.
+// ─────────────────────────────────────────────────────────────────────────────
+const hcaptchaProxyLimiter = rateLimit({
+    windowMs        : 60 * 1000,
+    max             : 60,
+    standardHeaders : true,
+    legacyHeaders   : false
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ANTI-DDOS: Login slow-down (progressive delay) — layered on top of
+// loginLimiter for defence-in-depth.
+//
+// Requests 1-3 per window: no delay (instant, normal user experience).
+// Requests 4+: each subsequent attempt adds 500 ms more delay.
+//   4th attempt: 500 ms  5th: 1000 ms  6th: 1500 ms … up to a 5-second cap.
+//
+// This makes credential-stuffing attacks extremely slow even before the hard
+// 429 from loginLimiter kicks in. Real users who mistype a password 1-2 times
+// are completely unaffected.
+// ─────────────────────────────────────────────────────────────────────────────
+const loginSlowDown = slowDown({
+    windowMs    : 15 * 60 * 1000,
+    delayAfter  : 3,
+    delayMs     : (hits) => Math.min((hits - 3) * 500, 5000)
+});
+
 app.use(express.json({ limit: "16kb" }));
 app.use(bodyParser.urlencoded({ extended: true, limit: "16kb" }));
 app.use(cookieParser());
+// express.static runs before globalLimiter intentionally — static files are
+// cheap and should not penalise users loading CSS/JS/images.
 app.use(express.static("public"));
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ANTI-DDOS: Request timeout — protects against Slowloris attacks where an
+// attacker sends headers/body bytes very slowly to hold sockets open.
+// Any request that doesn't complete within 10 seconds is terminated.
+// ─────────────────────────────────────────────────────────────────────────────
+app.use((req, res, next) => {
+    res.setTimeout(10000, () => {
+        res.status(408).json({ error: "Request timed out." });
+    });
+    next();
+});
+
+// Apply the global limiter to all routes that follow.
+app.use(globalLimiter);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // /config — returns only the hCaptcha public site key (VUL-A06).
@@ -244,7 +327,7 @@ function _fetchHcaptchaScript() {
     });
 }
 
-app.get("/hcaptcha-api.js", asyncHandler(async (req, res) => {
+app.get("/hcaptcha-api.js", hcaptchaProxyLimiter, asyncHandler(async (req, res) => {
     const now = Date.now();
 
     if (!_hcaptchaScript || now - _hcaptchaCachedAt > HCAPTCHA_CACHE_TTL) {
@@ -336,7 +419,7 @@ app.post("/signup", signupLimiter, asyncHandler(async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // /login — captchaToken forwarded to Supabase after basic format check.
 // ─────────────────────────────────────────────────────────────────────────────
-app.post("/login", loginLimiter, asyncHandler(async (req, res) => {
+app.post("/login", loginLimiter, loginSlowDown, asyncHandler(async (req, res) => {
     const { email, password, captchaToken } = req.body;
 
     if (!email || !password) {
@@ -365,7 +448,7 @@ app.post("/login", loginLimiter, asyncHandler(async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // SSO routes — wrapped in asyncHandler (VUL-A04).
 // ─────────────────────────────────────────────────────────────────────────────
-app.post("/googleSSO", asyncHandler(async (req, res) => {
+app.post("/googleSSO", ssoLimiter, asyncHandler(async (req, res) => {
     const { data, error } = await supabase.auth.signInWithOAuth({
         provider : "google",
         options  : { redirectTo: "https://infoassureproj-integrated-backend.onrender.com/callback" }
@@ -379,7 +462,7 @@ app.post("/googleSSO", asyncHandler(async (req, res) => {
     return res.redirect(data.url);
 }));
 
-app.post("/appleSSO", asyncHandler(async (req, res) => {
+app.post("/appleSSO", ssoLimiter, asyncHandler(async (req, res) => {
     const { data, error } = await supabase.auth.signInWithOAuth({
         provider : "apple",
         options  : { redirectTo: "https://infoassureproj-integrated-backend.onrender.com/callback" }
@@ -502,6 +585,14 @@ app.use((err, req, res, next) => {
     res.status(500).json({ error: "An unexpected error occurred." });
 });
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
     console.log(`Server running at http://localhost:${PORT}/`);
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ANTI-DDOS: Server-level socket timeout.
+// Closes idle TCP connections after 30 seconds. Without this, an attacker
+// can open thousands of connections and never send data (Slowloris variant),
+// eventually exhausting the OS file-descriptor limit.
+// ─────────────────────────────────────────────────────────────────────────────
+server.setTimeout(30000);
