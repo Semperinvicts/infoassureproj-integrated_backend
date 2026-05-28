@@ -48,7 +48,7 @@ let signinWidgetId = null;
 let hcaptchaSiteKey  = null;   // set after /config responds
 let hcaptchaReady    = false;  // set when window.onHcaptchaLoad fires
 
-const allPanels = ['panelSignup', 'panelSignin'];
+const allPanels = ['panelSignup', 'panelSignin', 'panelForgot'];
 
 // ── hCaptcha init ──────────────────────────────────────────────────────────────
 
@@ -358,7 +358,92 @@ function initLoginForm() {
     });
 }
 
-// ── Angry / lockout state ──────────────────────────────────────────────────────
+// ── Forgot-password panel ──────────────────────────────────────────────────────
+
+function showForgotPanel() {
+    showPanel('panelForgot');
+    // Hide tabs while in forgot-password flow; back link handles navigation.
+    const tabs = document.getElementById('mainTabs');
+    if (tabs) tabs.classList.add('tabs--hidden');
+    // Reset the panel to its form state in case it was previously in sent state.
+    const formState = document.getElementById('forgotFormState');
+    const sentState = document.getElementById('forgotSentState');
+    if (formState) formState.style.display = '';
+    if (sentState) sentState.style.display = 'none';
+    const fpErr = document.getElementById('fpErrMsg');
+    if (fpErr) fpErr.style.display = 'none';
+    const fpEmail = document.getElementById('fpEmail');
+    if (fpEmail) fpEmail.value = '';
+    const fpBtn = document.getElementById('fpSubmitBtn');
+    if (fpBtn) { fpBtn.disabled = false; fpBtn.textContent = 'Send reset link'; }
+}
+
+function backToSignin() {
+    const tabs = document.getElementById('mainTabs');
+    if (tabs) tabs.classList.remove('tabs--hidden');
+    switchTab('signin');
+}
+
+function initForgotPasswordForm() {
+    const form = document.getElementById('forgotForm');
+    if (!form) return;
+
+    form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+
+        const emailInput = document.getElementById('fpEmail');
+        const submitBtn  = document.getElementById('fpSubmitBtn');
+        const fpErr      = document.getElementById('fpErrMsg');
+
+        if (!emailInput.value.trim()) {
+            emailInput.classList.add('shake');
+            setTimeout(() => emailInput.classList.remove('shake'), 450);
+            return;
+        }
+
+        submitBtn.disabled    = true;
+        submitBtn.textContent = 'Sending…';
+        if (fpErr) fpErr.style.display = 'none';
+
+        try {
+            const resp = await fetch('/forgot-password', {
+                method  : 'POST',
+                headers : { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body    : new URLSearchParams({ email: emailInput.value.trim() })
+            });
+
+            // Always show the sent state regardless of whether the email is
+            // registered — this prevents user-enumeration attacks.
+            if (resp.ok || resp.status === 404) {
+                const formState = document.getElementById('forgotFormState');
+                const sentState = document.getElementById('forgotSentState');
+                if (formState) formState.style.display = 'none';
+                if (sentState) sentState.style.display = '';
+                return;
+            }
+
+            // Only surface a real error (e.g. rate-limit, server fault).
+            const data = await resp.json().catch(() => ({}));
+            if (fpErr) {
+                fpErr.textContent  = data.error || 'Something went wrong. Please try again.';
+                fpErr.style.display = 'block';
+            }
+            submitBtn.disabled    = false;
+            submitBtn.textContent = 'Send reset link';
+
+        } catch (networkErr) {
+            console.error('[forgot-password] Network error:', networkErr);
+            if (fpErr) {
+                fpErr.textContent  = 'Network error — please try again.';
+                fpErr.style.display = 'block';
+            }
+            submitBtn.disabled    = false;
+            submitBtn.textContent = 'Send reset link';
+        }
+    });
+}
+
+
 
 function triggerAngry() {
     isAngry = true;
@@ -467,11 +552,21 @@ document.addEventListener('DOMContentLoaded', () => {
     const logoutBtn = document.getElementById('logoutBtn');
     if (logoutBtn) logoutBtn.addEventListener('click', () => { window.location.href = '/logout'; });
 
+    // ── Wire forgot-password links ────────────────────────────────────────────
+    const forgotLink          = document.getElementById('forgotLink');
+    const backToSigninBtn     = document.getElementById('backToSigninBtn');
+    const backToSigninFromSent = document.getElementById('backToSigninFromSent');
+    if (forgotLink)           forgotLink.addEventListener('click',  () => showForgotPanel());
+    if (forgotLink)           forgotLink.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') showForgotPanel(); });
+    if (backToSigninBtn)      backToSigninBtn.addEventListener('click',  () => backToSignin());
+    if (backToSigninFromSent) backToSigninFromSent.addEventListener('click', () => backToSignin());
+
     if (document.getElementById('tabSignup')) {
         switchTab('signin');
         if (errMsg) errMsg.style.display = 'none';
         initSignupForm();
         initLoginForm();
+        initForgotPasswordForm();
     }
 
     fetchConfig();
