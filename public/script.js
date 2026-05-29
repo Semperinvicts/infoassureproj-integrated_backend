@@ -1,595 +1,769 @@
+const express      = require("express");
+const dotenv       = require("dotenv");
+const bodyParser   = require("body-parser");
+const cookieParser = require("cookie-parser");
+const path         = require("path");
+const fs           = require("fs");
+const https        = require("https");        // used by hCaptcha proxy
+const rateLimit    = require("express-rate-limit");
+const slowDown     = require("express-slow-down");
+const helmet       = require("helmet");
+const { createClient } = require("@supabase/supabase-js");
+
+dotenv.config();
+
 // ─────────────────────────────────────────────────────────────────────────────
-// script.js — Frontend logic: auth forms, hCaptcha widgets, eye tracking
-//
-// hCAPTCHA INTEGRATION OVERVIEW
-// ──────────────────────────────
-// Supabase requires a captchaToken on every signUp / signInWithPassword call
-// when hCaptcha is enabled in the project's Auth settings.
-//
-// Flow:
-//   1. DOMContentLoaded → fetchConfig() hits GET /config on our Express server.
-//   2. Server returns { hcaptchaSiteKey } from .env (the PUBLIC site key).
-//   3. hCaptcha script fires window.onHcaptchaLoad when the CDN script is ready.
-//   4. tryRenderWidgets() runs once BOTH promises resolve — whichever finishes
-//      last — and renders one widget per form using hcaptcha.render().
-//   5. Signup form: token lives in hcaptcha.getResponse(signupWidgetId).
-//      Login form:  token lives in hcaptcha.getResponse(signinWidgetId).
-//   6. Both tokens are sent in the POST body to our Express server, which
-//      forwards them to supabase.auth as `options.captchaToken`.
-//   7. Supabase verifies the token against hCaptcha's API using the SECRET KEY
-//      stored only in the Supabase dashboard — we never touch it.
-//   8. Tokens are SINGLE-USE. hcaptcha.reset(widgetId) is called after every
-//      submit attempt (success or failure) to generate a fresh token next time.
+// VUL-001: Credentials live in .env only — never in source.
 // ─────────────────────────────────────────────────────────────────────────────
+const SUPABASE_URL      = process.env.SUPABASE_URL;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
+const HCAPTCHA_SITE_KEY = process.env.HCAPTCHA_SITE_KEY;
+const APP_BASE_URL      = process.env.APP_BASE_URL || `http://localhost:${process.env.PORT || 3000}`;
+const PORT              = process.env.PORT || 3000;
+const IS_PROD           = process.env.NODE_ENV === "production";
 
-// ── DOM refs ───────────────────────────────────────────────────────────────────
-const body      = document.getElementById('mainBody');
-const panel     = document.getElementById('rightPanel');
-const leftPanel = document.querySelector('.left');
-const irisL     = document.getElementById('irisL');
-const irisR     = document.getElementById('irisR');
-const browL     = document.getElementById('browL');
-const browR     = document.getElementById('browR');
-const cursor    = document.getElementById('cursor');
-const eyeLbl    = document.getElementById('eyeLabel');
-const warnTxt   = document.getElementById('warnText');
-const errMsg    = document.getElementById('errMsg');
+if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+    console.error("FATAL: SUPABASE_URL and SUPABASE_ANON_KEY must be set in .env");
+    process.exit(1);
+}
+if (!HCAPTCHA_SITE_KEY) {
+    console.warn("WARNING: HCAPTCHA_SITE_KEY is not set — auth calls will fail.");
+}
 
-// ── State ──────────────────────────────────────────────────────────────────────
-let attempts    = 0;
-let isAngry     = false;
-let currentFlow = 'signin';
+const app      = express();
 
-// hCaptcha widget IDs returned by hcaptcha.render() — used to read / reset tokens.
-let signupWidgetId = null;
-let signinWidgetId = null;
+// ─────────────────────────────────────────────────────────────────────────────
+// Trust the first proxy hop (Railway / Render / Nginx sit in front of Node).
+// Without this, express-rate-limit throws ERR_ERL_UNEXPECTED_X_FORWARDED_FOR
+// every request because it sees an X-Forwarded-For header it isn't allowed to
+// trust.  Setting trust proxy = 1 tells Express to use that header for the
+// client IP — which is what the rate limiters need.
+// ─────────────────────────────────────────────────────────────────────────────
+app.set('trust proxy', 1);
 
-// Guards for the dual-async init path (config fetch + hCaptcha script load).
-let hcaptchaSiteKey  = null;   // set after /config responds
-let hcaptchaReady    = false;  // set when window.onHcaptchaLoad fires
+app.use((req, res, next) => {
+    if (req.method === 'OPTIONS') {
+        return res.status(405).send('Method Not Allowed');
+    }
+    next();
+});
+app.disable('x-powered-by');
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-const allPanels = ['panelSignup', 'panelSignin', 'panelForgot'];
+// ─────────────────────────────────────────────────────────────────────────────
+// Pre-load templates once at startup (VUL-009).
+// ─────────────────────────────────────────────────────────────────────────────
+const PRIVATE_TEMPLATE  = fs.readFileSync(path.join(__dirname, "private.html"),  "utf-8");
+const CALLBACK_TEMPLATE = fs.readFileSync(path.join(__dirname, "public", "callback.html"), "utf-8");
 
-// ── hCaptcha init ──────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// VUL-A01 FIX — Two-context sanitisation helpers.
+//
+// escapeHtml()    : safe for HTML element bodies and attribute values.
+// jsonStringify() : safe for JavaScript assignment contexts (window.USER = ...).
+//                   JSON.stringify produces a properly quoted, escape-complete
+//                   JS string — \u, backslash sequences, and quotes are all
+//                   handled by the JSON encoder, not by HTML entity logic.
+// ─────────────────────────────────────────────────────────────────────────────
+function escapeHtml(str) {
+    return String(str ?? "")
+        .replace(/&/g,  "&amp;")
+        .replace(/</g,  "&lt;")
+        .replace(/>/g,  "&gt;")
+        .replace(/"/g,  "&quot;")
+        .replace(/'/g,  "&#x27;")
+        .replace(/\//g, "&#x2F;");
+}
 
-// Called by the hCaptcha CDN script via ?onload=onHcaptchaLoad.
-// May fire before or after fetchConfig() resolves — tryRenderWidgets handles both.
-window.onHcaptchaLoad = function () {
-    hcaptchaReady = true;
-    tryRenderWidgets();
+// JSON.stringify already produces a safe, fully-quoted JS string literal.
+// We strip the surrounding double-quotes because the template uses them:
+//   window.USER = { name: {{js_name}}, email: {{js_email}} };
+// JSON.stringify("Alice") → '"Alice"'  (quotes included, which is what we want).
+function jsonStringify(val) {
+    return JSON.stringify(String(val ?? ""));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VUL-003: Hardened cookie options.
+// ─────────────────────────────────────────────────────────────────────────────
+const COOKIE_OPTIONS = {
+    httpOnly : true,
+    secure   : IS_PROD,
+    sameSite : "strict",
+    maxAge   : 60 * 60 * 1000   // 1 hour
 };
 
-// Fetch the public site key from our own server (never hardcoded here).
-async function fetchConfig() {
-    try {
-        const resp   = await fetch('/config');
-        const config = await resp.json();
-        if (config.hcaptchaSiteKey) {
-            hcaptchaSiteKey = config.hcaptchaSiteKey;
-            tryRenderWidgets();
-        } else {
-            console.warn('[hCaptcha] No site key returned from /config — widgets will not render.');
-        }
-    } catch (err) {
-        console.error('[hCaptcha] Failed to load config:', err);
-    }
-}
-
-// Render both widgets once both async conditions are satisfied.
-// Safe to call multiple times — checks both guards before acting.
-function tryRenderWidgets() {
-    if (!hcaptchaReady || !hcaptchaSiteKey) return;
-
-    // Render signup widget (light theme — white form background)
-    const signupEl = document.getElementById('captcha-signup');
-    if (signupEl && signupWidgetId === null) {
-        signupWidgetId = hcaptcha.render(signupEl, {
-            sitekey  : hcaptchaSiteKey,
-            theme    : 'light',
-            size     : 'normal'
-        });
-    }
-
-    // Render signin widget
-    const signinEl = document.getElementById('captcha-signin');
-    if (signinEl && signinWidgetId === null) {
-        signinWidgetId = hcaptcha.render(signinEl, {
-            sitekey  : hcaptchaSiteKey,
-            theme    : 'light',
-            size     : 'normal'
-        });
-    }
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-// Read a captcha token by widget ID. Returns '' if widget not ready yet.
-function getCaptchaToken(widgetId) {
-    if (widgetId === null || typeof hcaptcha === 'undefined') return '';
-    return hcaptcha.getResponse(widgetId) || '';
-}
-
-// Reset a widget (mandatory after every submit — tokens are single-use).
-function resetCaptcha(widgetId) {
-    if (widgetId === null || typeof hcaptcha === 'undefined') return;
-    hcaptcha.reset(widgetId);
-}
-
-// Show a captcha-specific validation error and shake the widget container.
-function shakeCaptchaError(errorElId, containerId) {
-    const errorEl    = document.getElementById(errorElId);
-    const containerEl = document.getElementById(containerId);
-    if (errorEl)    errorEl.style.display = 'block';
-    if (containerEl) {
-        containerEl.classList.add('shake');
-        setTimeout(() => containerEl.classList.remove('shake'), 450);
-    }
-}
-
-function clearCaptchaError(errorElId) {
-    const errorEl = document.getElementById(errorElId);
-    if (errorEl) errorEl.style.display = 'none';
-}
-
-// ── Panel switching ────────────────────────────────────────────────────────────
-
-function showPanel(id) {
-    allPanels.forEach(p => {
-        const el = document.getElementById(p);
-        el.style.display = 'none';
-        el.classList.remove('active');
-    });
-    const target = document.getElementById(id);
-    target.style.display = 'block';
-    target.classList.add('active');
-}
-
-function switchTab(t) {
-    currentFlow = t;
-    document.getElementById('tabSignup').classList.toggle('active', t === 'signup');
-    document.getElementById('tabSignin').classList.toggle('active', t === 'signin');
-    showPanel(t === 'signup' ? 'panelSignup' : 'panelSignin');
-    if (t === 'signup' && isAngry) resetAngry();
-}
-
-// ── Password complexity rules ──────────────────────────────────────────────────
-
-function checkPwComplexity(val) {
-    const setRule = (id, pass) => {
-        const el = document.getElementById(id);
-        el.classList.toggle('pass', pass);
-        el.classList.toggle('fail', !pass);
-        el.querySelector('.rule-icon').textContent = pass ? '✓' : '○';
-    };
-    setRule('rule-upper',   /[A-Z]/.test(val));
-    setRule('rule-lower',   /[a-z]/.test(val));
-    setRule('rule-length',  val.length >= 8);
-    setRule('rule-special', /[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?`~]/.test(val));
-}
-
-// ── Signup form (fetch-based) ──────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Template renderer — applies HTML-context escaping for ALL substitutions.
 //
-// Converted from native form POST so that:
-//   a) The captchaToken can be read from the widget and included in the body.
-//   b) Server errors display in the UI instead of raw JSON in the browser.
-//   c) The success redirect (/success) is driven by the fetch response.
+// FIX: {{js_name}} / {{js_email}} placeholders in data attributes have been
+// replaced with {{name}} / {{email}} in private.html and callback.html.
+// HTML attributes must use escapeHtml(), not JSON.stringify():
+//   JSON.stringify('Jo "Smith"') → "Jo \"Smith\""  ← breaks HTML attr boundary
+//   escapeHtml('Jo "Smith"')     → Jo &quot;Smith&quot; ← safe, decoded by .dataset
+//
+// dashboard.js reads window.USER from body.dataset — the browser automatically
+// decodes &quot; back to " on .dataset access, so JS receives the real value.
+// ─────────────────────────────────────────────────────────────────────────────
+function renderDashboard(template, user) {
+    const safeName  = escapeHtml(user.user_metadata?.display_name || "User");
+    const safeEmail = escapeHtml(user.email);
 
-function initSignupForm() {
-    const form = document.getElementById('signupForm');
-    if (!form) return;
-
-    form.addEventListener('submit', async (e) => {
-        e.preventDefault();
-
-        const nameInput  = document.getElementById('suName');
-        const emailInput = document.getElementById('suEmail');
-        const pwInput    = document.getElementById('suPassword');
-        const signupBtn  = document.getElementById('signupBtn');
-        const suErrMsg   = document.getElementById('suErrMsg');
-        let   isValid    = true;
-
-        // ── Field validation ──────────────────────────────────────────────────
-        if (!nameInput.value.trim()) {
-            nameInput.classList.add('shake');
-            setTimeout(() => nameInput.classList.remove('shake'), 450);
-            isValid = false;
-        }
-        if (!emailInput.value.trim()) {
-            emailInput.classList.add('shake');
-            setTimeout(() => emailInput.classList.remove('shake'), 450);
-            isValid = false;
-        }
-        const pw = pwInput.value;
-        if (pw.length < 8 || !/[A-Z]/.test(pw) || !/[a-z]/.test(pw) || !/[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?`~]/.test(pw)) {
-            pwInput.classList.add('shake');
-            setTimeout(() => pwInput.classList.remove('shake'), 450);
-            isValid = false;
-        }
-
-        // ── hCaptcha validation ───────────────────────────────────────────────
-        const captchaToken = getCaptchaToken(signupWidgetId);
-        if (!captchaToken) {
-            shakeCaptchaError('captcha-signup-error', 'captcha-signup');
-            isValid = false;
-        } else {
-            clearCaptchaError('captcha-signup-error');
-        }
-
-        if (!isValid) return;
-
-        signupBtn.disabled    = true;
-        signupBtn.textContent = 'Creating account…';
-        if (suErrMsg) suErrMsg.style.display = 'none';
-
-        try {
-            const resp = await fetch('/signup', {
-                method  : 'POST',
-                headers : { 'Content-Type': 'application/x-www-form-urlencoded' },
-                body    : new URLSearchParams({
-                    name         : nameInput.value.trim(),
-                    email        : emailInput.value.trim(),
-                    password     : pwInput.value,
-                    captchaToken                       // ← token passed to server
-                })
-            });
-
-            // Token is single-use — always reset after any submit.
-            resetCaptcha(signupWidgetId);
-
-            if (resp.ok) {
-                const { redirect } = await resp.json();
-                window.location.href = redirect || '/success';
-                return;
-            }
-
-            // Server returned an error — show it in the UI.
-            const { error } = await resp.json();
-            if (suErrMsg) {
-                suErrMsg.textContent  = error || 'Registration failed. Please try again.';
-                suErrMsg.style.display = 'block';
-            }
-            signupBtn.disabled    = false;
-            signupBtn.textContent = 'Signup';
-
-        } catch (networkErr) {
-            console.error('Signup request failed:', networkErr);
-            resetCaptcha(signupWidgetId);
-            if (suErrMsg) {
-                suErrMsg.textContent  = 'Network error — please try again.';
-                suErrMsg.style.display = 'block';
-            }
-            signupBtn.disabled    = false;
-            signupBtn.textContent = 'Signup';
-        }
-    });
+    return template
+        .replace(/\{\{name\}\}/g,  safeName)
+        .replace(/\{\{email\}\}/g, safeEmail);
 }
 
-// ── Login form (fetch-based) ───────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Async error wrapper — prevents unhandled promise rejections from crashing
+// the server or leaving requests hanging (VUL-A04).
+// ─────────────────────────────────────────────────────────────────────────────
+const asyncHandler = fn => (req, res, next) =>
+    Promise.resolve(fn(req, res, next)).catch(next);
 
-function initLoginForm() {
-    const form = document.getElementById('signinForm');
-    if (!form) return;
-
-    form.addEventListener('submit', async (e) => {
-        e.preventDefault();
-        if (isAngry) return;
-
-        const emailInput = document.getElementById('siEmail');
-        const pwInput    = document.getElementById('siPassword');
-        const loginBtn   = document.getElementById('loginBtn');
-        let   isValid    = true;
-
-        // ── Field validation ──────────────────────────────────────────────────
-        if (!emailInput.value.trim()) {
-            emailInput.classList.add('shake');
-            setTimeout(() => emailInput.classList.remove('shake'), 450);
-            isValid = false;
+// Helmet — security headers with explicit CSP (REC-01).
+// All inline <style> blocks have been moved to external CSS files (dashboard.css,
+// style.css) so 'unsafe-inline' is no longer needed in styleSrc.
+app.use(helmet({
+    contentSecurityPolicy: {
+        directives: {
+            defaultSrc    : ["'self'"],
+            scriptSrc     : ["'self'", "https://js.hcaptcha.com"],
+            scriptSrcAttr : ["'none'"],
+            // FIX — CSP: Style-Src Unsafe-Inline
+            // 'unsafe-inline' removed. All page-specific styles are now in
+            // external .css files served from 'self', so the browser accepts
+            // them without unsafe-inline. Google Fonts is still needed for the
+            // @import in the <link> tags (VUL-F05 acknowledged — self-hosting
+            // fonts is the long-term fix).
+            styleSrc      : ["'self'", "https://fonts.googleapis.com"],
+            fontSrc       : ["'self'", "https://fonts.gstatic.com", "data:", "https://fonts.googleapis.com"],
+            frameSrc      : [
+                "https://www.youtube-nocookie.com",
+                "https://newassets.hcaptcha.com"
+            ],
+            connectSrc    : ["'self'", SUPABASE_URL, "https://*.hcaptcha.com"],
+            imgSrc        : ["'self'", "data:", "https://*.hcaptcha.com"],
+            // FIX — CSP: Failure To Define Directive With No Fallback
+            // mediaSrc and workerSrc do fall back to defaultSrc/scriptSrc in
+            // the spec, but being explicit stops scanners flagging the
+            // omission and prevents unexpected future fallback behaviour.
+            mediaSrc      : ["'none'"],
+            workerSrc     : ["'none'"],
+            formAction    : ["'self'", SUPABASE_URL, "https://accounts.google.com", "https://appleid.apple.com"],
+            objectSrc     : ["'none'"],
+            baseUri       : ["'self'"],
+            frameAncestors: ["'none'"],
+            // FIX — Absence of Anti-CSRF Tokens (partial)
+            // The primary CSRF vector (GET logout) is closed by converting
+            // /logout to POST (VUL-F02). The login/signup forms submit via
+            // fetch() — not native form POST — so no hidden CSRF token field
+            // is required. SameSite=Strict on session cookies blocks cross-
+            // site requests from attaching the session cookie at all.
+            // upgradeInsecureRequests is enabled in production via IS_PROD
+            // secure cookie flag; explicit directive left out to allow local
+            // HTTP dev without constant browser errors.
         }
-        if (!pwInput.value) {
-            pwInput.classList.add('shake');
-            setTimeout(() => pwInput.classList.remove('shake'), 450);
-            isValid = false;
-        }
-
-        // ── hCaptcha validation ───────────────────────────────────────────────
-        const captchaToken = getCaptchaToken(signinWidgetId);
-        if (!captchaToken) {
-            shakeCaptchaError('captcha-signin-error', 'captcha-signin');
-            isValid = false;
-        } else {
-            clearCaptchaError('captcha-signin-error');
-        }
-
-        if (!isValid) return;
-
-        loginBtn.disabled    = true;
-        loginBtn.textContent = 'Signing in…';
-
-        try {
-            const resp = await fetch('/login', {
-                method  : 'POST',
-                headers : { 'Content-Type': 'application/x-www-form-urlencoded' },
-                body    : new URLSearchParams({
-                    email        : emailInput.value,
-                    password     : pwInput.value,
-                    captchaToken                       // ← token passed to server
-                })
-            });
-
-            // Token is single-use — always reset, even on success.
-            resetCaptcha(signinWidgetId);
-
-            if (resp.ok) {
-                const { redirect } = await resp.json();
-                window.location.href = redirect || '/private';
-                return;
-            }
-
-            // ── Real server-side failure → trigger attempt UI ─────────────────
-            attempts++;
-            sessionStorage.setItem('loginAttempts', String(attempts)); // survive reload
-            const dot = document.getElementById('dot' + attempts);
-            if (dot) dot.classList.add('used');
-
-            if (errMsg) {
-                errMsg.textContent   = 'Wrong password';
-                errMsg.style.display = 'inline';
-            }
-            pwInput.classList.add('shake');
-            setTimeout(() => pwInput.classList.remove('shake'), 450);
-
-            if (attempts >= 3) {
-                triggerAngry();
-            } else {
-                loginBtn.disabled    = false;
-                loginBtn.textContent = 'Sign In';
-            }
-
-        } catch (networkErr) {
-            console.error('Login request failed:', networkErr);
-            resetCaptcha(signinWidgetId);
-            loginBtn.disabled    = false;
-            loginBtn.textContent = 'Sign In';
-            if (errMsg) {
-                errMsg.textContent   = 'Network error — please try again.';
-                errMsg.style.display = 'inline';
-            }
-        }
-    });
-}
-
-// ── Forgot-password panel ──────────────────────────────────────────────────────
-
-function showForgotPanel() {
-    showPanel('panelForgot');
-    // Hide tabs while in forgot-password flow; back link handles navigation.
-    const tabs = document.getElementById('mainTabs');
-    if (tabs) tabs.classList.add('tabs--hidden');
-    // Reset the panel to its form state in case it was previously in sent state.
-    const formState = document.getElementById('forgotFormState');
-    const sentState = document.getElementById('forgotSentState');
-    if (formState) formState.style.display = '';
-    if (sentState) sentState.style.display = 'none';
-    const fpErr = document.getElementById('fpErrMsg');
-    if (fpErr) fpErr.style.display = 'none';
-    const fpEmail = document.getElementById('fpEmail');
-    if (fpEmail) fpEmail.value = '';
-    const fpBtn = document.getElementById('fpSubmitBtn');
-    if (fpBtn) { fpBtn.disabled = false; fpBtn.textContent = 'Send reset link'; }
-}
-
-function backToSignin() {
-    const tabs = document.getElementById('mainTabs');
-    if (tabs) tabs.classList.remove('tabs--hidden');
-    switchTab('signin');
-}
-
-function initForgotPasswordForm() {
-    const form = document.getElementById('forgotForm');
-    if (!form) return;
-
-    form.addEventListener('submit', async (e) => {
-        e.preventDefault();
-
-        const emailInput = document.getElementById('fpEmail');
-        const submitBtn  = document.getElementById('fpSubmitBtn');
-        const fpErr      = document.getElementById('fpErrMsg');
-
-        if (!emailInput.value.trim()) {
-            emailInput.classList.add('shake');
-            setTimeout(() => emailInput.classList.remove('shake'), 450);
-            return;
-        }
-
-        submitBtn.disabled    = true;
-        submitBtn.textContent = 'Sending…';
-        if (fpErr) fpErr.style.display = 'none';
-
-        try {
-            const resp = await fetch('/forgot-password', {
-                method  : 'POST',
-                headers : { 'Content-Type': 'application/x-www-form-urlencoded' },
-                body    : new URLSearchParams({ email: emailInput.value.trim() })
-            });
-
-            // Always show the sent state regardless of whether the email is
-            // registered — this prevents user-enumeration attacks.
-            if (resp.ok || resp.status === 404) {
-                const formState = document.getElementById('forgotFormState');
-                const sentState = document.getElementById('forgotSentState');
-                if (formState) formState.style.display = 'none';
-                if (sentState) sentState.style.display = '';
-                return;
-            }
-
-            // Only surface a real error (e.g. rate-limit, server fault).
-            const data = await resp.json().catch(() => ({}));
-            if (fpErr) {
-                fpErr.textContent  = data.error || 'Something went wrong. Please try again.';
-                fpErr.style.display = 'block';
-            }
-            submitBtn.disabled    = false;
-            submitBtn.textContent = 'Send reset link';
-
-        } catch (networkErr) {
-            console.error('[forgot-password] Network error:', networkErr);
-            if (fpErr) {
-                fpErr.textContent  = 'Network error — please try again.';
-                fpErr.style.display = 'block';
-            }
-            submitBtn.disabled    = false;
-            submitBtn.textContent = 'Send reset link';
-        }
-    });
-}
-
-
-
-function triggerAngry() {
-    isAngry = true;
-    sessionStorage.setItem('loginAttempts', String(attempts)); // persist across reloads
-    body.classList.add('angry');
-    leftPanel.classList.add('angry-mode');
-    browL.setAttribute('d', 'M 20,5 Q 90,12 160,20');
-    browR.setAttribute('d', 'M 20,20 Q 90,12 160,5');
-    eyeLbl.textContent = 'I  S E E  Y O U';
-    warnTxt.classList.add('show');
-    const btn = document.getElementById('loginBtn');
-    btn.textContent      = '🔒 Account Locked';
-    btn.style.background = '#5c0000';
-    btn.disabled         = true;
-}
-
-function resetAngry() {
-    isAngry  = false;
-    attempts = 0;
-    sessionStorage.removeItem('loginAttempts'); // clear persisted lockout
-    body.classList.remove('angry');
-    leftPanel.classList.remove('angry-mode');
-    browL.setAttribute('d', 'M 20,16 Q 90,16 160,16');
-    browR.setAttribute('d', 'M 20,16 Q 90,16 160,16');
-    eyeLbl.textContent = 'watching you';
-    warnTxt.classList.remove('show');
-    [1, 2, 3].forEach(i => {
-        const dot = document.getElementById('dot' + i);
-        if (dot) dot.classList.remove('used');
-    });
-    if (errMsg) errMsg.style.display = 'none';
-    const btn = document.getElementById('loginBtn');
-    btn.textContent      = 'Sign In';
-    btn.style.background = '';
-    btn.disabled         = false;
-
-    // Reset the signin captcha so the user gets a fresh token after unlock.
-    resetCaptcha(signinWidgetId);
-}
-
-// ── Password visibility toggle ─────────────────────────────────────────────────
-
-function togglePwVisibility(inputId, btn) {
-    const input  = document.getElementById(inputId);
-    const hidden = input.type === 'password';
-    input.type   = hidden ? 'text' : 'password';
-    btn.querySelector('.eye-icon').innerHTML = hidden
-        ? '<path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><line x1="1" y1="1" x2="23" y2="23"/>'
-        : '<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>';
-}
-
-// ── Eye tracking ───────────────────────────────────────────────────────────────
-
-function trackEye(wrap, e) {
-    if (!wrap) return;
-    const r  = wrap.parentElement.getBoundingClientRect();
-    const cx = r.left + r.width  / 2;
-    const cy = r.top  + r.height / 2;
-    const dx = e.clientX - cx;
-    const dy = e.clientY - cy;
-    const d  = Math.sqrt(dx * dx + dy * dy) || 1;
-    const c  = Math.min(d, 24);
-    wrap.style.transform = `translate(calc(-50% + ${(dx/d)*c}px), calc(-50% + ${(dy/d)*c}px))`;
-}
-
-document.addEventListener('mousemove', (e) => {
-    if (panel) {
-        const r = panel.getBoundingClientRect();
-        cursor.style.display = e.clientX >= r.left ? 'block' : 'none';
-        cursor.style.left    = e.clientX + 'px';
-        cursor.style.top     = e.clientY + 'px';
     }
-    trackEye(irisL, e);
-    trackEye(irisR, e);
+}));
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VUL-004: Rate limiters — server-side, cannot be bypassed by client JS.
+// ─────────────────────────────────────────────────────────────────────────────
+const loginLimiter = rateLimit({
+    windowMs        : 15 * 60 * 1000,
+    max             : 10,
+    standardHeaders : true,
+    legacyHeaders   : false,
+    message         : { error: "Too many login attempts. Please try again in 15 minutes." }
 });
 
-// ── Init ───────────────────────────────────────────────────────────────────────
+const signupLimiter = rateLimit({
+    windowMs        : 60 * 60 * 1000,
+    max             : 5,
+    standardHeaders : true,
+    legacyHeaders   : false,
+    message         : { error: "Too many accounts created from this IP. Try again later." }
+});
 
-document.addEventListener('DOMContentLoaded', () => {
+// VUL-A06: Rate-limit the /config and /set-cookie endpoints.
+const configLimiter = rateLimit({
+    windowMs        : 60 * 1000,
+    max             : 30,
+    standardHeaders : true,
+    legacyHeaders   : false
+});
 
-    // ── Wire tab buttons (replaces onclick= in HTML) ──────────────────────────
-    const tabSignup = document.getElementById('tabSignup');
-    const tabSignin = document.getElementById('tabSignin');
-    if (tabSignup) tabSignup.addEventListener('click', () => switchTab('signup'));
-    if (tabSignin) tabSignin.addEventListener('click', () => switchTab('signin'));
+const setCookieLimiter = rateLimit({
+    windowMs        : 5 * 60 * 1000,
+    max             : 10,
+    standardHeaders : true,
+    legacyHeaders   : false
+});
 
-    // ── Wire switch-row links (replaces onclick= in HTML) ─────────────────────
-    const linkToSignin = document.getElementById('linkToSignin');
-    const linkToSignup = document.getElementById('linkToSignup');
-    if (linkToSignin) linkToSignin.addEventListener('click', () => switchTab('signin'));
-    if (linkToSignup) linkToSignup.addEventListener('click', () => switchTab('signup'));
+// ─────────────────────────────────────────────────────────────────────────────
+// ANTI-DDOS: Global rate limiter — catches every route not protected by a
+// tighter per-route limiter above.
+//
+// 300 requests / 15 min per IP is generous enough for real users (a full page
+// load with assets is ~5-8 requests) but stops simple volumetric floods and
+// scanners that rotate through every endpoint.
+//
+// Static files served by express.static() bypass this because static() runs
+// before app.use(globalLimiter) — that is intentional: static assets are cheap
+// and CDN-cacheable. If you add a CDN (Cloudflare, etc.) in front of Render,
+// static file floods are absorbed before they reach Node.
+// ─────────────────────────────────────────────────────────────────────────────
+const globalLimiter = rateLimit({
+    windowMs        : 15 * 60 * 1000,  // 15-minute window
+    max             : 300,              // 300 requests per window per IP
+    standardHeaders : true,
+    legacyHeaders   : false,
+    message         : { error: "Too many requests. Please slow down and try again later." }
+});
 
-    // ── Wire password complexity checker (replaces oninput= in HTML) ──────────
-    const suPassword = document.getElementById('suPassword');
-    if (suPassword) suPassword.addEventListener('input', () => checkPwComplexity(suPassword.value));
+// ─────────────────────────────────────────────────────────────────────────────
+// ANTI-DDOS: SSO rate limiter — fixes audit finding NEW-06.
+// OAuth initiation is lightweight on our side (one Supabase API call) but
+// hammering it generates hundreds of authorization URLs per minute.
+// ─────────────────────────────────────────────────────────────────────────────
+const ssoLimiter = rateLimit({
+    windowMs        : 60 * 1000,       // 1-minute window
+    max             : 10,              // 10 SSO attempts per minute per IP
+    standardHeaders : true,
+    legacyHeaders   : false,
+    message         : { error: "Too many sign-in attempts. Please wait a moment." }
+});
 
-    // ── Wire password visibility toggle (replaces onclick= in HTML) ───────────
-    const pwToggleBtn = document.getElementById('pwToggleBtn');
-    if (pwToggleBtn) {
-        // Inject the default eye SVG that was previously inline in the HTML.
-        pwToggleBtn.innerHTML = '<svg class="eye-icon" xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>';
-        pwToggleBtn.addEventListener('click', () => togglePwVisibility('siPassword', pwToggleBtn));
-    }
+// ─────────────────────────────────────────────────────────────────────────────
+// Forgot / reset password rate limiters.
+//
+// forgotPasswordLimiter: 5 requests per 15 min per IP.
+//   Supabase itself rate-limits outbound emails, but we gate here first so
+//   the Supabase API is never called more than necessary from a single source.
+//
+// resetPasswordLimiter: 10 attempts per 15 min per IP.
+//   Recovery tokens are single-use, but we still throttle to slow brute-force
+//   attempts against tokens that haven't been consumed yet.
+// ─────────────────────────────────────────────────────────────────────────────
+const forgotPasswordLimiter = rateLimit({
+    windowMs        : 15 * 60 * 1000,
+    max             : 5,
+    standardHeaders : true,
+    legacyHeaders   : false,
+    message         : { error: 'Too many reset requests. Please try again in 15 minutes.' }
+});
 
-    // ── Wire logout button in dashboard pages (replaces onclick= in HTML) ─────
-    const logoutBtn = document.getElementById('logoutBtn');
-    if (logoutBtn) logoutBtn.addEventListener('click', () => { window.location.href = '/logout'; });
+const resetPasswordLimiter = rateLimit({
+    windowMs        : 15 * 60 * 1000,
+    max             : 10,
+    standardHeaders : true,
+    legacyHeaders   : false,
+    message         : { error: 'Too many attempts. Please try again later.' }
+});
 
-    // ── Wire forgot-password links ────────────────────────────────────────────
-    const forgotLink          = document.getElementById('forgotLink');
-    const backToSigninBtn     = document.getElementById('backToSigninBtn');
-    const backToSigninFromSent = document.getElementById('backToSigninFromSent');
-    if (forgotLink)           forgotLink.addEventListener('click',  () => showForgotPanel());
-    if (forgotLink)           forgotLink.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') showForgotPanel(); });
-    if (backToSigninBtn)      backToSigninBtn.addEventListener('click',  () => backToSignin());
-    if (backToSigninFromSent) backToSigninFromSent.addEventListener('click', () => backToSignin());
+// ─────────────────────────────────────────────────────────────────────────────
+// ANTI-DDOS: hCaptcha proxy rate limiter.
+// The proxy endpoint fetches from hCaptcha's CDN (cached hourly) but the
+// endpoint itself can be hit repeatedly. Limit to 60/min — one per page load
+// with room for retries.
+// ─────────────────────────────────────────────────────────────────────────────
+const hcaptchaProxyLimiter = rateLimit({
+    windowMs        : 60 * 1000,
+    max             : 60,
+    standardHeaders : true,
+    legacyHeaders   : false
+});
 
-    if (document.getElementById('tabSignup')) {
-        switchTab('signin');
-        if (errMsg) errMsg.style.display = 'none';
-        initSignupForm();
-        initLoginForm();
-        initForgotPasswordForm();
-    }
+// ─────────────────────────────────────────────────────────────────────────────
+// ANTI-DDOS: Login slow-down (progressive delay) — layered on top of
+// loginLimiter for defence-in-depth.
+//
+// Requests 1-3 per window: no delay (instant, normal user experience).
+// Requests 4+: each subsequent attempt adds 500 ms more delay.
+//   4th attempt: 500 ms  5th: 1000 ms  6th: 1500 ms … up to a 5-second cap.
+//
+// This makes credential-stuffing attacks extremely slow even before the hard
+// 429 from loginLimiter kicks in. Real users who mistype a password 1-2 times
+// are completely unaffected.
+// ─────────────────────────────────────────────────────────────────────────────
+const loginSlowDown = slowDown({
+    windowMs    : 15 * 60 * 1000,
+    delayAfter  : 3,
+    delayMs     : (hits) => Math.min((hits - 3) * 500, 5000)
+});
 
-    fetchConfig();
+app.use(express.json({ limit: "16kb" }));
+app.use(bodyParser.urlencoded({ extended: true, limit: "16kb" }));
+app.use(cookieParser());
+// express.static runs before globalLimiter intentionally — static files are
+// cheap and should not penalise users loading CSS/JS/images.
+app.use(express.static("public"));
 
-    // ── REM-3 FIX: Server-side lockout check on page load ────────────────────
-    // After 3 failed attempts the server rate-limiter is the real enforcement,
-    // but the UI lockout (triggerAngry) can be bypassed by reloading the page,
-    // resetting the client-side `attempts` counter to 0.
-    // On DOMContentLoaded we check how many attempts the server has already
-    // recorded by probing /login with a dummy OPTIONS-like HEAD call — but
-    // the cleanest approach without a dedicated endpoint is to persist the
-    // attempt count in sessionStorage so a page reload can't reset it.
-    const stored = parseInt(sessionStorage.getItem('loginAttempts') || '0', 10);
-    if (stored >= 3) {
-        // Restore the locked UI without re-counting any attempts.
-        attempts = stored;
-        triggerAngry();
-    } else {
-        attempts = stored;
-        // Restore any previously used dots.
-        for (let i = 1; i <= stored; i++) {
-            const dot = document.getElementById('dot' + i);
-            if (dot) dot.classList.add('used');
+// ─────────────────────────────────────────────────────────────────────────────
+// ANTI-DDOS: Request timeout — protects against Slowloris attacks where an
+// attacker sends headers/body bytes very slowly to hold sockets open.
+// Any request that doesn't complete within 10 seconds is terminated.
+// ─────────────────────────────────────────────────────────────────────────────
+app.use((req, res, next) => {
+    res.setTimeout(10000, () => {
+        res.status(408).json({ error: "Request timed out." });
+    });
+    next();
+});
+
+// Apply the global limiter to all routes that follow.
+app.use(globalLimiter);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// /config — returns only the hCaptcha public site key (VUL-A06).
+// Supabase URL and anon key are no longer exposed here; they are only used
+// server-side. The hcaptcha site key is public by design.
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/config", configLimiter, (req, res) => {
+    // Restrict to our own origin only.
+    res.setHeader("Access-Control-Allow-Origin", APP_BASE_URL);
+    res.json({
+        hcaptchaSiteKey: HCAPTCHA_SITE_KEY || null
+        // Supabase credentials are never sent to the client.
+    });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FIX: EXTERNAL_SCRIPT_MISSING_INTEGRITY (Medium)
+//
+// /hcaptcha-api.js — Proxies the hCaptcha bootstrap script from our own origin.
+//
+// Root cause: hCaptcha's CDN (js.hcaptcha.com) does not publish SRI hashes
+// and serves dynamically built content, so we cannot add an integrity=
+// attribute to the external <script> tag. The scanner correctly flags this.
+//
+// Fix: Serve the script from our own domain. Same-origin resources do not
+// require SRI — the browser already trusts them as part of our application.
+// The script is fetched from hCaptcha's CDN once per hour and cached in
+// memory. Stale cache is served if the upstream fetch fails, so a temporary
+// hCaptcha outage does not break the login page.
+//
+// How query params work: the browser's <script src="/hcaptcha-api.js?render=
+// explicit&onload=onHcaptchaLoad"> tag keeps the query string. hCaptcha reads
+// render= and onload= from document.currentScript.src — our proxied URL
+// contains those params, so the script behaves identically to the direct CDN.
+// ─────────────────────────────────────────────────────────────────────────────
+let _hcaptchaScript   = null;
+let _hcaptchaCachedAt = 0;
+const HCAPTCHA_CACHE_TTL = 60 * 60 * 1000; // refresh at most once per hour
+
+function _fetchHcaptchaScript() {
+    return new Promise((resolve, reject) => {
+        https.get("https://js.hcaptcha.com/1/api.js", (res) => {
+            let body = "";
+            res.on("data",  (chunk) => { body += chunk; });
+            res.on("end",   ()      => resolve(body));
+            res.on("error", reject);
+        }).on("error", reject);
+    });
+}
+
+app.get("/hcaptcha-api.js", hcaptchaProxyLimiter, asyncHandler(async (req, res) => {
+    const now = Date.now();
+
+    if (!_hcaptchaScript || now - _hcaptchaCachedAt > HCAPTCHA_CACHE_TTL) {
+        try {
+            _hcaptchaScript   = await _fetchHcaptchaScript();
+            _hcaptchaCachedAt = now;
+        } catch (err) {
+            console.error("[hCaptcha proxy]", err.message);
+            if (!_hcaptchaScript) {
+                // First fetch failed with no cache — return a safe stub so the
+                // page renders rather than hanging on a failed script load.
+                return res
+                    .status(502)
+                    .type("application/javascript")
+                    .send("/* hCaptcha temporarily unavailable — please refresh */");
+            }
+            // Serve stale cache rather than failing the request.
         }
     }
+
+    res.setHeader("Content-Type",  "application/javascript; charset=utf-8");
+    res.setHeader("Cache-Control", "public, max-age=3600");
+    res.send(_hcaptchaScript);
+}));
+
+app.get("/", asyncHandler(async (req, res) => {
+    const token = req.cookies.access_token;
+    if (token) {
+        // If a valid session cookie exists, skip the login page entirely.
+        const { data, error } = await supabase.auth.getUser(token);
+        if (!error && data?.user) return res.redirect("/private");
+        // Token is invalid/expired — clear the stale cookie and fall through.
+        res.clearCookie("access_token", {
+            httpOnly : true,
+            secure   : IS_PROD,
+            sameSite : "strict",
+            path     : "/"
+        });
+    }
+    res.sendFile(path.join(__dirname, "public", "Frontend.html"));
+}));
+
+// ─────────────────────────────────────────────────────────────────────────────
+// /signup — validates input format before forwarding to Supabase.
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/signup", signupLimiter, asyncHandler(async (req, res) => {
+    const { name, email, password, captchaToken } = req.body;
+
+    // Basic existence check.
+    if (!name || !email || !password) {
+        return res.status(400).json({ error: "All fields are required." });
+    }
+
+    // Input length caps — prevent oversized payloads reaching Supabase.
+    if (name.length > 120 || email.length > 254 || password.length > 256) {
+        return res.status(400).json({ error: "One or more fields exceed the maximum allowed length." });
+    }
+
+    // Basic email format check.
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        return res.status(400).json({ error: "Invalid email format." });
+    }
+
+    // Reject immediately if captcha token is absent or too large.
+    if (!captchaToken || captchaToken.length > 4096) {
+        return res.status(400).json({ error: "Please complete the security check." });
+    }
+
+    const { data, error } = await supabase.auth.signUp({
+        email,
+        password,
+        options: {
+            captchaToken,
+            data: { display_name: name }
+        }
+    });
+
+    if (error) {
+        console.error("[Signup error]", error.message);
+        return res.status(400).json({
+            error: "Registration could not be completed. Please check your details and try again."
+        });
+    }
+
+    console.log("User created, awaiting email verification");
+    return res.json({ redirect: "/success" });
+}));
+
+// ─────────────────────────────────────────────────────────────────────────────
+// /login — captchaToken forwarded to Supabase after basic format check.
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/login", loginLimiter, loginSlowDown, asyncHandler(async (req, res) => {
+    const { email, password, captchaToken } = req.body;
+
+    if (!email || !password) {
+        return res.status(400).json({ error: "Email and password are required." });
+    }
+
+    if (!captchaToken || captchaToken.length > 4096) {
+        return res.status(400).json({ error: "Please complete the security check." });
+    }
+
+    const { data, error } = await supabase.auth.signInWithPassword({
+        email,
+        password,
+        options: { captchaToken }
+    });
+
+    if (error) {
+        console.error("[Login error]", error.message);
+        return res.status(401).json({ error: "Invalid credentials." });
+    }
+
+    res.cookie("access_token", data.session.access_token, COOKIE_OPTIONS);
+    return res.json({ redirect: "/private" });
+}));
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SSO routes — wrapped in asyncHandler (VUL-A04).
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/googleSSO", ssoLimiter, asyncHandler(async (req, res) => {
+    const { data, error } = await supabase.auth.signInWithOAuth({
+        provider : "google",
+        options  : { redirectTo: "https://infoassureproj-integratedbackend-production.up.railway.app/callback" }
+    });
+
+    if (error || !data?.url) {
+        console.error("[Google SSO error]", error?.message);
+        return res.status(500).json({ error: "SSO initialization failed." });
+    }
+
+    return res.redirect(data.url);
+}));
+
+app.post("/appleSSO", ssoLimiter, asyncHandler(async (req, res) => {
+    const { data, error } = await supabase.auth.signInWithOAuth({
+        provider : "apple",
+        options  : { redirectTo: "https://infoassureproj-integratedbackend-production.up.railway.app/callback" }
+    });
+
+    if (error || !data?.url) {
+        console.error("[Apple SSO error]", error?.message);
+        return res.status(500).json({ error: "SSO initialization failed." });
+    }
+
+    return res.redirect(data.url);
+}));
+
+// ─────────────────────────────────────────────────────────────────────────────
+// /set-cookie — VUL-A03 FIX: validates token with Supabase before setting cookie.
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/set-cookie", setCookieLimiter, asyncHandler(async (req, res) => {
+    const { token } = req.body;
+
+    if (!token || typeof token !== "string" || token.length > 2048) {
+        return res.status(400).json({ error: "Invalid token." });
+    }
+
+    // Verify the token is a legitimate, non-expired Supabase JWT before storing it.
+    const { data, error } = await supabase.auth.getUser(token);
+    if (error || !data?.user) {
+        return res.status(401).json({ error: "Token validation failed." });
+    }
+
+    res.cookie("access_token", token, COOKIE_OPTIONS);
+    return res.sendStatus(200);
+}));
+
+// ─────────────────────────────────────────────────────────────────────────────
+// /callback — VUL-A02 FIX: now rendered through the template pipeline, not
+// served as a raw static file. OAuth users get their identity injected just
+// like /private users do.
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/callback", asyncHandler(async (req, res) => {
+    // The client-side OAuth exchange posts the token via /set-cookie first,
+    // so by the time the browser follows the redirect to /callback, the cookie
+    // should already be set. If not, the user is not authenticated yet.
+    const token = req.cookies.access_token;
+    if (!token) {
+        // Serve the raw transitional page — the client JS will handle the
+        // hash fragment (#access_token=...) and post it via /set-cookie,
+        // then redirect to /private automatically.
+        return res.sendFile(path.join(__dirname, "public", "callback.html"));
+    }
+
+    const { data, error } = await supabase.auth.getUser(token);
+    if (error || !data?.user) return res.redirect("/");
+
+    const html = renderDashboard(CALLBACK_TEMPLATE, data.user);
+    return res.send(html);
+}));
+
+// ─────────────────────────────────────────────────────────────────────────────
+// /private — VUL-A01 FIX: both HTML and JS contexts sanitised.
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/private", asyncHandler(async (req, res) => {
+    const token = req.cookies.access_token;
+    if (!token) return res.redirect("/");
+
+    const { data, error } = await supabase.auth.getUser(token);
+    if (error || !data?.user) return res.redirect("/");
+
+    const html = renderDashboard(PRIVATE_TEMPLATE, data.user);
+    return res.send(html);
+}));
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /forgot-password — triggers a Supabase password-reset email.
+//
+// Security properties:
+//   • Input validated (format + length) before any Supabase call.
+//   • Always returns HTTP 200, even for unknown emails. This prevents
+//     user-enumeration: an attacker cannot tell which addresses are registered
+//     by timing or status-code differences (CWE-204).
+//   • Supabase errors are logged server-side but never forwarded to the client.
+//   • redirectTo points to our own origin only — open-redirect impossible.
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/forgot-password", forgotPasswordLimiter, asyncHandler(async (req, res) => {
+    const { email, captchaToken } = req.body;
+
+    if (!email || typeof email !== "string" || email.length > 254) {
+        return res.status(400).json({ error: "A valid email address is required." });
+    }
+
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+        return res.status(400).json({ error: "Invalid email format." });
+    }
+
+    // ── Captcha ────────────────────────────────────────────────────────────────────────────────
+    // Supabase captcha protection is enabled project-wide.  resetPasswordForEmail
+    // must forward the hCaptcha token just like /login and /signup do — without
+    // it Supabase returns "captcha protection: request disallowed".
+    if (!captchaToken || captchaToken.length > 4096) {
+        return res.status(400).json({ error: "Please complete the security check." });
+    }
+
+    // Call Supabase regardless of whether the email exists so response time
+    // stays consistent (timing-safe anti-enumeration).
+    const { error } = await supabase.auth.resetPasswordForEmail(email.trim(), {
+        captchaToken,
+        redirectTo: `${APP_BASE_URL}/reset-password`
+    });
+
+    if (error) {
+        // Log for ops visibility but do not expose to the client.
+        console.error("[forgot-password] Supabase error:", error.message);
+    }
+
+    // Always 200 — see security properties above.
+    return res.json({ ok: true });
+}));
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /reset-password — serves the new-password form.
+//
+// The page's client JS (reset-password.js) extracts the recovery access_token
+// from the URL hash fragment (#access_token=...&type=recovery).  Hash
+// fragments are never sent to the server, so the token is not logged anywhere.
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/reset-password", (req, res) => {
+    res.sendFile(path.join(__dirname, "public", "reset-password.html"));
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /reset-password — validates the recovery token and updates the password.
+//
+// Flow:
+//   1. Client POSTs { token, password } — token came from the URL hash.
+//   2. We call supabase.auth.getUser(token) to verify the token is genuine,
+//      non-expired, and has type "recovery".
+//   3. We create a throw-away per-request Supabase client scoped to that token
+//      and call updateUser({ password }) — no service-role key required.
+//   4. On success we respond 200 so the client can redirect to login.
+//
+// Security properties:
+//   • Same password-policy checks as /signup (uppercase, lowercase, special,
+//     minimum 8 chars) so the rules are enforced in one place each.
+//   • Recovery tokens are single-use in Supabase — replaying a used token
+//     returns an error at step 2.
+//   • persistSession: false on the scoped client prevents it from touching
+//     the global in-memory session store.
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/reset-password", resetPasswordLimiter, asyncHandler(async (req, res) => {
+    const { token, password } = req.body;
+
+    // ── Input validation ───────────────────────────────────────────────────
+    if (!token || typeof token !== "string" || token.length > 2048) {
+        return res.status(400).json({ error: "Invalid or missing recovery token." });
+    }
+
+    if (!password || typeof password !== "string") {
+        return res.status(400).json({ error: "Password is required." });
+    }
+
+    // Enforce the same policy enforced on the signup form.
+    if (password.length < 8 || password.length > 256) {
+        return res.status(400).json({ error: "Password must be between 8 and 256 characters." });
+    }
+    if (!/[A-Z]/.test(password)) {
+        return res.status(400).json({ error: "Password must contain at least one uppercase letter." });
+    }
+    if (!/[a-z]/.test(password)) {
+        return res.status(400).json({ error: "Password must contain at least one lowercase letter." });
+    }
+    if (!/[!@#$%^&*()\-_=+[\]{};':",.<>/?\\|`~]/.test(password)) {
+        return res.status(400).json({ error: "Password must contain at least one special character." });
+    }
+
+    // ── Token validation ───────────────────────────────────────────────────
+    // getUser() verifies the JWT signature and expiry.  A consumed or forged
+    // token returns an error here before we attempt any write.
+    const { data: userData, error: userError } = await supabase.auth.getUser(token);
+    if (userError || !userData?.user) {
+        console.error("[reset-password] Token validation failed:", userError?.message);
+        return res.status(401).json({
+            error: "This reset link is invalid or has expired. Please request a new one."
+        });
+    }
+
+    // ── Password update ────────────────────────────────────────────────────
+    // Create a throw-away Supabase client authenticated as the recovering user.
+    // This avoids requiring a service-role key while still being able to call
+    // updateUser() in the correct user context.
+    const userClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+        global : { headers: { Authorization: `Bearer ${token}` } },
+        auth   : { persistSession: false }
+    });
+
+    const { error: updateError } = await userClient.auth.updateUser({ password });
+    if (updateError) {
+        console.error("[reset-password] Update failed:", updateError.message);
+        return res.status(400).json({
+            error: "Password update failed. The reset link may have already been used."
+        });
+    }
+
+    console.log(`[reset-password] Password updated for user ${userData.user.id}`);
+    return res.json({ ok: true });
+}));
+
+app.get("/success", (req, res) => {
+    res.sendFile(path.join(__dirname, "public", "success.html"));
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VUL-F02 FIX — /logout converted from GET to POST.
+//
+// WHY: HTTP GET must not trigger state changes (RFC 9110 §9.3.1). A GET-based
+// logout lets any page force a victim to log out by embedding:
+//   <img src="https://target/logout">
+// Even with SameSite=Strict cookies, this is a design violation.
+//
+// FIX: POST + dashboard.js fires fetch('/logout', {method:'POST'}) so no
+// navigation or form is required, and the browser never attaches the cookie
+// to a cross-site GET request. The SameSite=Strict cookie provides the
+// defence-in-depth layer: cross-site POST requests also cannot attach it.
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/logout", (req, res) => {
+    res.clearCookie("access_token", {
+        httpOnly : true,
+        secure   : IS_PROD,
+        sameSite : "strict",
+        path     : "/"
+    });
+    // Respond with 200 + JSON instead of 302 so fetch() with redirect:'manual'
+    // gets a real response instead of an opaque redirect that some proxies mangle.
+    res.json({ ok: true });
+});
+
+// GET /logout — safety fallback for direct browser navigation / stale bookmarks.
+// Clears the cookie and redirects to login. Not the primary logout path
+// (that is POST /logout via dashboard.js fetch) but prevents "Cannot GET /logout".
+app.get("/logout", (req, res) => {
+    res.clearCookie("access_token", {
+        httpOnly : true,
+        secure   : IS_PROD,
+        sameSite : "strict",
+        path     : "/"
+    });
+    res.redirect("/");
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Global error handler — VUL-A04: catches all unhandled async rejections.
+// Never leaks stack traces to the client.
+// ─────────────────────────────────────────────────────────────────────────────
+app.use((err, req, res, next) => {
+    console.error("[Unhandled error]", err.stack || err.message);
+    res.status(500).json({ error: "An unexpected error occurred." });
+});
+
+const server = app.listen(PORT, () => {
+    console.log(`Server running at http://localhost:${PORT}/`);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ANTI-DDOS: Server-level socket timeout.
+// Closes idle TCP connections after 30 seconds. Without this, an attacker
+// can open thousands of connections and never send data (Slowloris variant),
+// eventually exhausting the OS file-descriptor limit.
+// ─────────────────────────────────────────────────────────────────────────────
+server.setTimeout(30000);

@@ -31,6 +31,16 @@ if (!HCAPTCHA_SITE_KEY) {
 }
 
 const app      = express();
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Trust the first proxy hop (Railway / Render / Nginx sit in front of Node).
+// Without this, express-rate-limit throws ERR_ERL_UNEXPECTED_X_FORWARDED_FOR
+// every request because it sees an X-Forwarded-For header it isn't allowed to
+// trust.  Setting trust proxy = 1 tells Express to use that header for the
+// client IP — which is what the rate limiters need.
+// ─────────────────────────────────────────────────────────────────────────────
+app.set('trust proxy', 1);
+
 app.use((req, res, next) => {
     if (req.method === 'OPTIONS') {
         return res.status(405).send('Method Not Allowed');
@@ -573,7 +583,7 @@ app.get("/private", asyncHandler(async (req, res) => {
 //   • redirectTo points to our own origin only — open-redirect impossible.
 // ─────────────────────────────────────────────────────────────────────────────
 app.post("/forgot-password", forgotPasswordLimiter, asyncHandler(async (req, res) => {
-    const { email } = req.body;
+    const { email, captchaToken } = req.body;
 
     if (!email || typeof email !== "string" || email.length > 254) {
         return res.status(400).json({ error: "A valid email address is required." });
@@ -583,9 +593,18 @@ app.post("/forgot-password", forgotPasswordLimiter, asyncHandler(async (req, res
         return res.status(400).json({ error: "Invalid email format." });
     }
 
+    // ── Captcha ────────────────────────────────────────────────────────────────────────────────
+    // Supabase captcha protection is enabled project-wide.  resetPasswordForEmail
+    // must forward the hCaptcha token just like /login and /signup do — without
+    // it Supabase returns "captcha protection: request disallowed".
+    if (!captchaToken || captchaToken.length > 4096) {
+        return res.status(400).json({ error: "Please complete the security check." });
+    }
+
     // Call Supabase regardless of whether the email exists so response time
     // stays consistent (timing-safe anti-enumeration).
     const { error } = await supabase.auth.resetPasswordForEmail(email.trim(), {
+        captchaToken,
         redirectTo: `${APP_BASE_URL}/reset-password`
     });
 
