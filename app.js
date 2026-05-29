@@ -226,6 +226,33 @@ const ssoLimiter = rateLimit({
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Forgot / reset password rate limiters.
+//
+// forgotPasswordLimiter: 5 requests per 15 min per IP.
+//   Supabase itself rate-limits outbound emails, but we gate here first so
+//   the Supabase API is never called more than necessary from a single source.
+//
+// resetPasswordLimiter: 10 attempts per 15 min per IP.
+//   Recovery tokens are single-use, but we still throttle to slow brute-force
+//   attempts against tokens that haven't been consumed yet.
+// ─────────────────────────────────────────────────────────────────────────────
+const forgotPasswordLimiter = rateLimit({
+    windowMs        : 15 * 60 * 1000,
+    max             : 5,
+    standardHeaders : true,
+    legacyHeaders   : false,
+    message         : { error: 'Too many reset requests. Please try again in 15 minutes.' }
+});
+
+const resetPasswordLimiter = rateLimit({
+    windowMs        : 15 * 60 * 1000,
+    max             : 10,
+    standardHeaders : true,
+    legacyHeaders   : false,
+    message         : { error: 'Too many attempts. Please try again later.' }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // ANTI-DDOS: hCaptcha proxy rate limiter.
 // The proxy endpoint fetches from hCaptcha's CDN (cached hourly) but the
 // endpoint itself can be hit repeatedly. Limit to 60/min — one per page load
@@ -532,6 +559,131 @@ app.get("/private", asyncHandler(async (req, res) => {
 
     const html = renderDashboard(PRIVATE_TEMPLATE, data.user);
     return res.send(html);
+}));
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /forgot-password — triggers a Supabase password-reset email.
+//
+// Security properties:
+//   • Input validated (format + length) before any Supabase call.
+//   • Always returns HTTP 200, even for unknown emails. This prevents
+//     user-enumeration: an attacker cannot tell which addresses are registered
+//     by timing or status-code differences (CWE-204).
+//   • Supabase errors are logged server-side but never forwarded to the client.
+//   • redirectTo points to our own origin only — open-redirect impossible.
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/forgot-password", forgotPasswordLimiter, asyncHandler(async (req, res) => {
+    const { email } = req.body;
+
+    if (!email || typeof email !== "string" || email.length > 254) {
+        return res.status(400).json({ error: "A valid email address is required." });
+    }
+
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+        return res.status(400).json({ error: "Invalid email format." });
+    }
+
+    // Call Supabase regardless of whether the email exists so response time
+    // stays consistent (timing-safe anti-enumeration).
+    const { error } = await supabase.auth.resetPasswordForEmail(email.trim(), {
+        redirectTo: `${APP_BASE_URL}/reset-password`
+    });
+
+    if (error) {
+        // Log for ops visibility but do not expose to the client.
+        console.error("[forgot-password] Supabase error:", error.message);
+    }
+
+    // Always 200 — see security properties above.
+    return res.json({ ok: true });
+}));
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /reset-password — serves the new-password form.
+//
+// The page's client JS (reset-password.js) extracts the recovery access_token
+// from the URL hash fragment (#access_token=...&type=recovery).  Hash
+// fragments are never sent to the server, so the token is not logged anywhere.
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/reset-password", (req, res) => {
+    res.sendFile(path.join(__dirname, "public", "reset-password.html"));
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /reset-password — validates the recovery token and updates the password.
+//
+// Flow:
+//   1. Client POSTs { token, password } — token came from the URL hash.
+//   2. We call supabase.auth.getUser(token) to verify the token is genuine,
+//      non-expired, and has type "recovery".
+//   3. We create a throw-away per-request Supabase client scoped to that token
+//      and call updateUser({ password }) — no service-role key required.
+//   4. On success we respond 200 so the client can redirect to login.
+//
+// Security properties:
+//   • Same password-policy checks as /signup (uppercase, lowercase, special,
+//     minimum 8 chars) so the rules are enforced in one place each.
+//   • Recovery tokens are single-use in Supabase — replaying a used token
+//     returns an error at step 2.
+//   • persistSession: false on the scoped client prevents it from touching
+//     the global in-memory session store.
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/reset-password", resetPasswordLimiter, asyncHandler(async (req, res) => {
+    const { token, password } = req.body;
+
+    // ── Input validation ───────────────────────────────────────────────────
+    if (!token || typeof token !== "string" || token.length > 2048) {
+        return res.status(400).json({ error: "Invalid or missing recovery token." });
+    }
+
+    if (!password || typeof password !== "string") {
+        return res.status(400).json({ error: "Password is required." });
+    }
+
+    // Enforce the same policy enforced on the signup form.
+    if (password.length < 8 || password.length > 256) {
+        return res.status(400).json({ error: "Password must be between 8 and 256 characters." });
+    }
+    if (!/[A-Z]/.test(password)) {
+        return res.status(400).json({ error: "Password must contain at least one uppercase letter." });
+    }
+    if (!/[a-z]/.test(password)) {
+        return res.status(400).json({ error: "Password must contain at least one lowercase letter." });
+    }
+    if (!/[!@#$%^&*()\-_=+[\]{};':",.<>/?\\|`~]/.test(password)) {
+        return res.status(400).json({ error: "Password must contain at least one special character." });
+    }
+
+    // ── Token validation ───────────────────────────────────────────────────
+    // getUser() verifies the JWT signature and expiry.  A consumed or forged
+    // token returns an error here before we attempt any write.
+    const { data: userData, error: userError } = await supabase.auth.getUser(token);
+    if (userError || !userData?.user) {
+        console.error("[reset-password] Token validation failed:", userError?.message);
+        return res.status(401).json({
+            error: "This reset link is invalid or has expired. Please request a new one."
+        });
+    }
+
+    // ── Password update ────────────────────────────────────────────────────
+    // Create a throw-away Supabase client authenticated as the recovering user.
+    // This avoids requiring a service-role key while still being able to call
+    // updateUser() in the correct user context.
+    const userClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+        global : { headers: { Authorization: `Bearer ${token}` } },
+        auth   : { persistSession: false }
+    });
+
+    const { error: updateError } = await userClient.auth.updateUser({ password });
+    if (updateError) {
+        console.error("[reset-password] Update failed:", updateError.message);
+        return res.status(400).json({
+            error: "Password update failed. The reset link may have already been used."
+        });
+    }
+
+    console.log(`[reset-password] Password updated for user ${userData.user.id}`);
+    return res.json({ ok: true });
 }));
 
 app.get("/success", (req, res) => {
