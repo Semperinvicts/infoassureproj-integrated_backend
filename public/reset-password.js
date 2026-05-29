@@ -43,11 +43,6 @@
     // Remove tokens from the address bar immediately.
     history.replaceState(null, '', window.location.pathname);
 
-    // ── Step 2: Validate token presence and type ─────────────────────────────
-    if ((!accessToken && !tokenHash) || type !== 'recovery') {
-        show('stateError');
-        return;
-    }
 
     // ── Step 3: Show form (legacy) or exchange token_hash first (PKCE) ───────
     let token = accessToken;
