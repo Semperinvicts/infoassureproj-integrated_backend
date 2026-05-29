@@ -43,6 +43,7 @@ let currentFlow = 'signin';
 // hCaptcha widget IDs returned by hcaptcha.render() — used to read / reset tokens.
 let signupWidgetId = null;
 let signinWidgetId = null;
+let forgotWidgetId = null;
 
 // Guards for the dual-async init path (config fetch + hCaptcha script load).
 let hcaptchaSiteKey  = null;   // set after /config responds
@@ -100,6 +101,15 @@ function tryRenderWidgets() {
         });
     }
 
+    // Render forgot-password widget
+    const forgotEl = document.getElementById('captcha-forgot');
+    if (forgotEl && forgotWidgetId === null) {
+        forgotWidgetId = hcaptcha.render(forgotEl, {
+            sitekey  : hcaptchaSiteKey,
+            theme    : 'light',
+            size     : 'normal'
+        });
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -382,6 +392,7 @@ function showForgotPanel() {
 function backToSignin() {
     const tabs = document.getElementById('mainTabs');
     if (tabs) tabs.classList.remove('tabs--hidden');
+    resetCaptcha(forgotWidgetId);
     switchTab('signin');
 }
 
@@ -406,15 +417,27 @@ function initForgotPasswordForm() {
         submitBtn.textContent = 'Sending…';
         if (fpErr) fpErr.style.display = 'none';
 
+        // Validate captcha token before submitting.
+        const captchaToken = getCaptchaToken(forgotWidgetId);
+        if (!captchaToken) {
+            shakeCaptchaError('captcha-forgot-error', 'captcha-forgot');
+            submitBtn.disabled    = false;
+            submitBtn.textContent = 'Send reset link';
+            return;
+        }
+        clearCaptchaError('captcha-forgot-error');
+
         try {
             const resp = await fetch('/forgot-password', {
                 method  : 'POST',
                 headers : { 'Content-Type': 'application/x-www-form-urlencoded' },
-                body    : new URLSearchParams({ email: emailInput.value.trim() })
+                body    : new URLSearchParams({ email: emailInput.value.trim(), captchaToken })
             });
 
             // Always show the sent state regardless of whether the email is
             // registered — this prevents user-enumeration attacks.
+            resetCaptcha(forgotWidgetId);
+
             if (resp.ok || resp.status === 404) {
                 const formState = document.getElementById('forgotFormState');
                 const sentState = document.getElementById('forgotSentState');
@@ -434,6 +457,7 @@ function initForgotPasswordForm() {
 
         } catch (networkErr) {
             console.error('[forgot-password] Network error:', networkErr);
+            resetCaptcha(forgotWidgetId);
             if (fpErr) {
                 fpErr.textContent  = 'Network error — please try again.';
                 fpErr.style.display = 'block';

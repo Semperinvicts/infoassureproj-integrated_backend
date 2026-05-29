@@ -151,6 +151,12 @@
                     <label>Email address</label>
                     <input type="email" id="fpEmail" name="email" placeholder="Enter your email">
                 </div>
+                <!-- hCaptcha widget for forgot-password -->
+                <div class="captcha-wrap">
+                    <div id="captcha-forgot"></div>
+                </div>
+                <p class="captcha-error" id="captcha-forgot-error">Please complete the security check.</p>
+
                 <p class="form-error" id="fpErrMsg"></p>
                 <button class="btn-primary" id="fpSubmitBtn" type="submit">Send reset link</button>
             </form>
