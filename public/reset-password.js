@@ -24,24 +24,52 @@
         });
     }
 
-    // ── Step 1: Extract recovery token from URL hash ─────────────────────────
-    const hash   = window.location.hash.slice(1);
-    const params = new URLSearchParams(hash);
-    const token  = params.get('access_token');
-    const type   = params.get('type');
+    // ── Step 1: Extract recovery token ──────────────────────────────────────
+    //
+    // Supabase sends the token in one of two ways depending on project settings:
+    //
+    // Old flow:  /reset-password#access_token=...&type=recovery  (hash fragment)
+    // New flow:  /reset-password?token_hash=...&type=recovery    (query param)
+    //
+    // We check both so this page works regardless of which flow Supabase uses.
 
-    // Remove the token from the address bar immediately so it isn't stored
-    // in browser history or visible to extensions reading location.href.
+    const hashParams  = new URLSearchParams(window.location.hash.slice(1));
+    const queryParams = new URLSearchParams(window.location.search);
+
+    const accessToken = hashParams.get('access_token');   // old flow
+    const tokenHash   = queryParams.get('token_hash');    // new PKCE flow
+    const type        = queryParams.get('type') || hashParams.get('type');
+
+    // Remove tokens from the address bar immediately.
     history.replaceState(null, '', window.location.pathname);
 
     // ── Step 2: Validate token presence and type ─────────────────────────────
-    if (!token || type !== 'recovery') {
-        // No valid recovery fragment — the link is bad, expired, or already used.
+    if ((!accessToken && !tokenHash) || type !== 'recovery') {
         show('stateError');
         return;
     }
 
-    // ── Step 3: Show the new-password form ───────────────────────────────────
+    // ── Step 3: Show form (legacy) or exchange token_hash first (PKCE) ───────
+    let token = accessToken;
+
+    if (tokenHash) {
+        // PKCE flow: exchange token_hash server-side for a usable access_token.
+        try {
+            const resp = await fetch('/verify-reset-token', {
+                method  : 'POST',
+                headers : { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body    : new URLSearchParams({ token_hash: tokenHash, type: 'recovery' })
+            });
+            if (!resp.ok) { show('stateError'); return; }
+            const data = await resp.json();
+            token = data.access_token;
+            if (!token) { show('stateError'); return; }
+        } catch (_) {
+            show('stateError');
+            return;
+        }
+    }
+
     show('stateForm');
 
     // ── Password-strength live feedback ─────────────────────────────────────

@@ -101,15 +101,6 @@ function tryRenderWidgets() {
         });
     }
 
-    // Render forgot-password widget
-    const forgotEl = document.getElementById('captcha-forgot');
-    if (forgotEl && forgotWidgetId === null) {
-        forgotWidgetId = hcaptcha.render(forgotEl, {
-            sitekey  : hcaptchaSiteKey,
-            theme    : 'light',
-            size     : 'normal'
-        });
-    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

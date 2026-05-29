@@ -154,6 +154,15 @@ app.use(helmet({
             objectSrc     : ["'none'"],
             baseUri       : ["'self'"],
             frameAncestors: ["'none'"],
+            // FIX — Absence of Anti-CSRF Tokens (partial)
+            // The primary CSRF vector (GET logout) is closed by converting
+            // /logout to POST (VUL-F02). The login/signup forms submit via
+            // fetch() — not native form POST — so no hidden CSRF token field
+            // is required. SameSite=Strict on session cookies blocks cross-
+            // site requests from attaching the session cookie at all.
+            // upgradeInsecureRequests is enabled in production via IS_PROD
+            // secure cookie flag; explicit directive left out to allow local
+            // HTTP dev without constant browser errors.
         }
     }
 }));
@@ -192,6 +201,19 @@ const setCookieLimiter = rateLimit({
     legacyHeaders   : false
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ANTI-DDOS: Global rate limiter — catches every route not protected by a
+// tighter per-route limiter above.
+//
+// 300 requests / 15 min per IP is generous enough for real users (a full page
+// load with assets is ~5-8 requests) but stops simple volumetric floods and
+// scanners that rotate through every endpoint.
+//
+// Static files served by express.static() bypass this because static() runs
+// before app.use(globalLimiter) — that is intentional: static assets are cheap
+// and CDN-cacheable. If you add a CDN (Cloudflare, etc.) in front of Render,
+// static file floods are absorbed before they reach Node.
+// ─────────────────────────────────────────────────────────────────────────────
 const globalLimiter = rateLimit({
     windowMs        : 15 * 60 * 1000,  // 15-minute window
     max             : 300,              // 300 requests per window per IP
@@ -200,6 +222,11 @@ const globalLimiter = rateLimit({
     message         : { error: "Too many requests. Please slow down and try again later." }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ANTI-DDOS: SSO rate limiter — fixes audit finding NEW-06.
+// OAuth initiation is lightweight on our side (one Supabase API call) but
+// hammering it generates hundreds of authorization URLs per minute.
+// ─────────────────────────────────────────────────────────────────────────────
 const ssoLimiter = rateLimit({
     windowMs        : 60 * 1000,       // 1-minute window
     max             : 10,              // 10 SSO attempts per minute per IP
@@ -208,6 +235,17 @@ const ssoLimiter = rateLimit({
     message         : { error: "Too many sign-in attempts. Please wait a moment." }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Forgot / reset password rate limiters.
+//
+// forgotPasswordLimiter: 5 requests per 15 min per IP.
+//   Supabase itself rate-limits outbound emails, but we gate here first so
+//   the Supabase API is never called more than necessary from a single source.
+//
+// resetPasswordLimiter: 10 attempts per 15 min per IP.
+//   Recovery tokens are single-use, but we still throttle to slow brute-force
+//   attempts against tokens that haven't been consumed yet.
+// ─────────────────────────────────────────────────────────────────────────────
 const forgotPasswordLimiter = rateLimit({
     windowMs        : 15 * 60 * 1000,
     max             : 5,
@@ -224,6 +262,12 @@ const resetPasswordLimiter = rateLimit({
     message         : { error: 'Too many attempts. Please try again later.' }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ANTI-DDOS: hCaptcha proxy rate limiter.
+// The proxy endpoint fetches from hCaptcha's CDN (cached hourly) but the
+// endpoint itself can be hit repeatedly. Limit to 60/min — one per page load
+// with room for retries.
+// ─────────────────────────────────────────────────────────────────────────────
 const hcaptchaProxyLimiter = rateLimit({
     windowMs        : 60 * 1000,
     max             : 60,
@@ -231,6 +275,18 @@ const hcaptchaProxyLimiter = rateLimit({
     legacyHeaders   : false
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ANTI-DDOS: Login slow-down (progressive delay) — layered on top of
+// loginLimiter for defence-in-depth.
+//
+// Requests 1-3 per window: no delay (instant, normal user experience).
+// Requests 4+: each subsequent attempt adds 500 ms more delay.
+//   4th attempt: 500 ms  5th: 1000 ms  6th: 1500 ms … up to a 5-second cap.
+//
+// This makes credential-stuffing attacks extremely slow even before the hard
+// 429 from loginLimiter kicks in. Real users who mistype a password 1-2 times
+// are completely unaffected.
+// ─────────────────────────────────────────────────────────────────────────────
 const loginSlowDown = slowDown({
     windowMs    : 15 * 60 * 1000,
     delayAfter  : 3,
@@ -240,6 +296,15 @@ const loginSlowDown = slowDown({
 app.use(express.json({ limit: "16kb" }));
 app.use(bodyParser.urlencoded({ extended: true, limit: "16kb" }));
 app.use(cookieParser());
+// express.static runs before globalLimiter intentionally — static files are
+// cheap and should not penalise users loading CSS/JS/images.
+app.use(express.static("public"));
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ANTI-DDOS: Request timeout — protects against Slowloris attacks where an
+// attacker sends headers/body bytes very slowly to hold sockets open.
+// Any request that doesn't complete within 10 seconds is terminated.
+// ─────────────────────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
     res.setTimeout(10000, () => {
         res.status(408).json({ error: "Request timed out." });
@@ -260,8 +325,30 @@ app.get("/config", configLimiter, (req, res) => {
     res.setHeader("Access-Control-Allow-Origin", APP_BASE_URL);
     res.json({
         hcaptchaSiteKey: HCAPTCHA_SITE_KEY || null
+        // Supabase credentials are never sent to the client.
     });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FIX: EXTERNAL_SCRIPT_MISSING_INTEGRITY (Medium)
+//
+// /hcaptcha-api.js — Proxies the hCaptcha bootstrap script from our own origin.
+//
+// Root cause: hCaptcha's CDN (js.hcaptcha.com) does not publish SRI hashes
+// and serves dynamically built content, so we cannot add an integrity=
+// attribute to the external <script> tag. The scanner correctly flags this.
+//
+// Fix: Serve the script from our own domain. Same-origin resources do not
+// require SRI — the browser already trusts them as part of our application.
+// The script is fetched from hCaptcha's CDN once per hour and cached in
+// memory. Stale cache is served if the upstream fetch fails, so a temporary
+// hCaptcha outage does not break the login page.
+//
+// How query params work: the browser's <script src="/hcaptcha-api.js?render=
+// explicit&onload=onHcaptchaLoad"> tag keeps the query string. hCaptcha reads
+// render= and onload= from document.currentScript.src — our proxied URL
+// contains those params, so the script behaves identically to the direct CDN.
+// ─────────────────────────────────────────────────────────────────────────────
 let _hcaptchaScript   = null;
 let _hcaptchaCachedAt = 0;
 const HCAPTCHA_CACHE_TTL = 60 * 60 * 1000; // refresh at most once per hour
@@ -351,8 +438,7 @@ app.post("/signup", signupLimiter, asyncHandler(async (req, res) => {
         password,
         options: {
             captchaToken,
-            data: { display_name: name },
-            emailRedirectTo: `${APP_BASE_URL}/callback`
+            data: { display_name: name }
         }
     });
 
@@ -485,6 +571,17 @@ app.get("/private", asyncHandler(async (req, res) => {
     return res.send(html);
 }));
 
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /forgot-password — triggers a Supabase password-reset email.
+//
+// Security properties:
+//   • Input validated (format + length) before any Supabase call.
+//   • Always returns HTTP 200, even for unknown emails. This prevents
+//     user-enumeration: an attacker cannot tell which addresses are registered
+//     by timing or status-code differences (CWE-204).
+//   • Supabase errors are logged server-side but never forwarded to the client.
+//   • redirectTo points to our own origin only — open-redirect impossible.
+// ─────────────────────────────────────────────────────────────────────────────
 app.post("/forgot-password", forgotPasswordLimiter, asyncHandler(async (req, res) => {
     const { email, captchaToken } = req.body;
 
@@ -495,21 +592,59 @@ app.post("/forgot-password", forgotPasswordLimiter, asyncHandler(async (req, res
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
         return res.status(400).json({ error: "Invalid email format." });
     }
+
+    // Supabase captcha protection is enabled project-wide. resetPasswordForEmail
+    // must forward the hCaptcha token just like /login and /signup do.
     if (!captchaToken || captchaToken.length > 4096) {
         return res.status(400).json({ error: "Please complete the security check." });
     }
 
+    // Call Supabase regardless of whether the email exists so response time
+    // stays consistent (timing-safe anti-enumeration).
     const { error } = await supabase.auth.resetPasswordForEmail(email.trim(), {
         captchaToken,
         redirectTo: `${APP_BASE_URL}/reset-password`
     });
 
     if (error) {
+        // Log for ops visibility but do not expose to the client.
         console.error("[forgot-password] Supabase error:", error.message);
     }
 
     // Always 200 — see security properties above.
     return res.json({ ok: true });
+}));
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /verify-reset-token — exchanges a PKCE token_hash for an access_token.
+//
+// Newer Supabase projects use PKCE flow: the reset email contains a token_hash
+// query parameter instead of an access_token hash fragment. The client POSTs
+// the token_hash here; we call supabase.auth.verifyOtp() to exchange it for a
+// real access_token, then return that to the client so it can call
+// POST /reset-password as normal. This keeps raw tokens off the client URL.
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/verify-reset-token", resetPasswordLimiter, asyncHandler(async (req, res) => {
+    const { token_hash, type } = req.body;
+
+    if (!token_hash || typeof token_hash !== "string" || token_hash.length > 2048) {
+        return res.status(400).json({ error: "Invalid token." });
+    }
+    if (type !== "recovery") {
+        return res.status(400).json({ error: "Invalid token type." });
+    }
+
+    const { data, error } = await supabase.auth.verifyOtp({
+        token_hash,
+        type: "recovery"
+    });
+
+    if (error || !data?.session?.access_token) {
+        console.error("[verify-reset-token] Error:", error?.message);
+        return res.status(401).json({ error: "Token invalid or expired." });
+    }
+
+    return res.json({ access_token: data.session.access_token });
 }));
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -523,6 +658,25 @@ app.get("/reset-password", (req, res) => {
     res.sendFile(path.join(__dirname, "public", "reset-password.html"));
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /reset-password — validates the recovery token and updates the password.
+//
+// Flow:
+//   1. Client POSTs { token, password } — token came from the URL hash.
+//   2. We call supabase.auth.getUser(token) to verify the token is genuine,
+//      non-expired, and has type "recovery".
+//   3. We create a throw-away per-request Supabase client scoped to that token
+//      and call updateUser({ password }) — no service-role key required.
+//   4. On success we respond 200 so the client can redirect to login.
+//
+// Security properties:
+//   • Same password-policy checks as /signup (uppercase, lowercase, special,
+//     minimum 8 chars) so the rules are enforced in one place each.
+//   • Recovery tokens are single-use in Supabase — replaying a used token
+//     returns an error at step 2.
+//   • persistSession: false on the scoped client prevents it from touching
+//     the global in-memory session store.
+// ─────────────────────────────────────────────────────────────────────────────
 app.post("/reset-password", resetPasswordLimiter, asyncHandler(async (req, res) => {
     const { token, password } = req.body;
 
@@ -636,4 +790,10 @@ const server = app.listen(PORT, () => {
     console.log(`Server running at http://localhost:${PORT}/`);
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ANTI-DDOS: Server-level socket timeout.
+// Closes idle TCP connections after 30 seconds. Without this, an attacker
+// can open thousands of connections and never send data (Slowloris variant),
+// eventually exhausting the OS file-descriptor limit.
+// ─────────────────────────────────────────────────────────────────────────────
 server.setTimeout(30000);
