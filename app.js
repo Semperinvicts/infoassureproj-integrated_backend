@@ -438,7 +438,8 @@ app.post("/signup", signupLimiter, asyncHandler(async (req, res) => {
         password,
         options: {
             captchaToken,
-            data: { display_name: name }
+            data: { display_name: name },
+            emailRedirectTo: `${APP_BASE_URL}/callback`
         }
     });
 
