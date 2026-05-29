@@ -96,6 +96,33 @@
         });
     }
 
+    // ── NEW: Password-match live feedback ───────────────────────────────────
+    const confirmEl = document.getElementById('rpConfirm');
+    const matchContainer = document.getElementById('rpMatchContainer');
+    const matchRule = document.getElementById('rp-rule-match');
+
+    function checkMatch() {
+        if (!confirmEl || !confirmEl.value) {
+            // Hide the indicator if the confirm field is completely empty
+            if (matchContainer) matchContainer.style.display = 'none';
+            return;
+        }
+        
+        // Show the indicator
+        if (matchContainer) matchContainer.style.display = 'flex';
+        
+        // Compare values
+        const matches = pwInput.value === confirmEl.value;
+        if (matchRule) {
+            matchRule.classList.toggle('pass', matches);
+            matchRule.classList.toggle('fail', !matches);
+            matchRule.querySelector('.rule-icon').textContent = matches ? '✓' : '✗';
+        }
+    }
+
+    if (pwInput) pwInput.addEventListener('input', checkMatch);
+    if (confirmEl) confirmEl.addEventListener('input', checkMatch);
+
     // ── Show / hide password toggle ─────────────────────────────────────────
     const toggleBtn = document.getElementById('rpToggleBtn');
     if (toggleBtn && pwInput) {

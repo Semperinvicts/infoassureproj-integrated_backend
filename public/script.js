@@ -208,6 +208,12 @@ function initSignupForm() {
             isValid = false;
         }
 
+        if (confirmInput && pw !== confirmInput.value) {
+            confirmInput.classList.add('shake');
+            setTimeout(() => confirmInput.classList.remove('shake'), 450);
+            isValid = false;
+        }
+
         // ── hCaptcha validation ───────────────────────────────────────────────
         const captchaToken = getCaptchaToken(signupWidgetId);
         if (!captchaToken) {
@@ -571,6 +577,28 @@ document.addEventListener('DOMContentLoaded', () => {
     // ── Wire password complexity checker (replaces oninput= in HTML) ──────────
     const suPassword = document.getElementById('suPassword');
     if (suPassword) suPassword.addEventListener('input', () => checkPwComplexity(suPassword.value));
+
+    const suConfirm = document.getElementById('suConfirmPassword');
+    const suMatchContainer = document.getElementById('suMatchContainer');
+    const suRuleMatch = document.getElementById('su-rule-match');
+
+    function checkSignupMatch() {
+        if (!suConfirm || !suConfirm.value) {
+            if (suMatchContainer) suMatchContainer.style.display = 'none';
+            return;
+        }
+        if (suMatchContainer) suMatchContainer.style.display = 'flex';
+        
+        const matches = suPassword.value === suConfirm.value;
+        if (suRuleMatch) {
+            suRuleMatch.classList.toggle('pass', matches);
+            suRuleMatch.classList.toggle('fail', !matches);
+            suRuleMatch.querySelector('.rule-icon').textContent = matches ? '✓' : '✗';
+        }
+    }
+
+    if (suPassword) suPassword.addEventListener('input', checkSignupMatch);
+    if (suConfirm)  suConfirm.addEventListener('input', checkSignupMatch);
 
     // ── Wire password visibility toggle (replaces onclick= in HTML) ───────────
     const pwToggleBtn = document.getElementById('pwToggleBtn');
