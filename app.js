@@ -438,8 +438,7 @@ app.post("/signup", signupLimiter, asyncHandler(async (req, res) => {
         password,
         options: {
             captchaToken,
-            data: { display_name: name },
-            emailRedirectTo: `${APP_BASE_URL}/callback`
+            data: { display_name: name }
         }
     });
 
@@ -584,7 +583,7 @@ app.get("/private", asyncHandler(async (req, res) => {
 //   • redirectTo points to our own origin only — open-redirect impossible.
 // ─────────────────────────────────────────────────────────────────────────────
 app.post("/forgot-password", forgotPasswordLimiter, asyncHandler(async (req, res) => {
-    const { email, captchaToken } = req.body;
+    const { email } = req.body;
 
     if (!email || typeof email !== "string" || email.length > 254) {
         return res.status(400).json({ error: "A valid email address is required." });
@@ -594,18 +593,9 @@ app.post("/forgot-password", forgotPasswordLimiter, asyncHandler(async (req, res
         return res.status(400).json({ error: "Invalid email format." });
     }
 
-    // ── Captcha ────────────────────────────────────────────────────────────────────────────────
-    // Supabase captcha protection is enabled project-wide.  resetPasswordForEmail
-    // must forward the hCaptcha token just like /login and /signup do — without
-    // it Supabase returns "captcha protection: request disallowed".
-    if (!captchaToken || captchaToken.length > 4096) {
-        return res.status(400).json({ error: "Please complete the security check." });
-    }
-
     // Call Supabase regardless of whether the email exists so response time
     // stays consistent (timing-safe anti-enumeration).
     const { error } = await supabase.auth.resetPasswordForEmail(email.trim(), {
-        captchaToken,
         redirectTo: `${APP_BASE_URL}/reset-password`
     });
 
@@ -616,6 +606,38 @@ app.post("/forgot-password", forgotPasswordLimiter, asyncHandler(async (req, res
 
     // Always 200 — see security properties above.
     return res.json({ ok: true });
+}));
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /verify-reset-token — exchanges a PKCE token_hash for an access_token.
+//
+// Newer Supabase projects use PKCE flow: the reset email contains a token_hash
+// query parameter instead of an access_token hash fragment. The client POSTs
+// the token_hash here; we call supabase.auth.verifyOtp() to exchange it for a
+// real access_token, then return that to the client so it can call
+// POST /reset-password as normal. This keeps raw tokens off the client URL.
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/verify-reset-token", resetPasswordLimiter, asyncHandler(async (req, res) => {
+    const { token_hash, type } = req.body;
+
+    if (!token_hash || typeof token_hash !== "string" || token_hash.length > 2048) {
+        return res.status(400).json({ error: "Invalid token." });
+    }
+    if (type !== "recovery") {
+        return res.status(400).json({ error: "Invalid token type." });
+    }
+
+    const { data, error } = await supabase.auth.verifyOtp({
+        token_hash,
+        type: "recovery"
+    });
+
+    if (error || !data?.session?.access_token) {
+        console.error("[verify-reset-token] Error:", error?.message);
+        return res.status(401).json({ error: "Token invalid or expired." });
+    }
+
+    return res.json({ access_token: data.session.access_token });
 }));
 
 // ─────────────────────────────────────────────────────────────────────────────
