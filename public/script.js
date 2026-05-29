@@ -364,6 +364,20 @@ function initLoginForm() {
 
 function showForgotPanel() {
     showPanel('panelForgot');
+
+    // Render the forgot captcha widget lazily — only once the panel is visible.
+    // Rendering while the panel is hidden (display:none) produces a zero-size
+    // widget that never appears. We defer until the user actually opens this panel.
+    if (hcaptchaReady && hcaptchaSiteKey) {
+        const forgotEl = document.getElementById('captcha-forgot');
+        if (forgotEl && forgotWidgetId === null) {
+            forgotWidgetId = hcaptcha.render(forgotEl, {
+                sitekey  : hcaptchaSiteKey,
+                theme    : 'light',
+                size     : 'normal'
+            });
+        }
+    }
     // Hide tabs while in forgot-password flow; back link handles navigation.
     const tabs = document.getElementById('mainTabs');
     if (tabs) tabs.classList.add('tabs--hidden');
