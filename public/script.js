@@ -551,7 +551,9 @@ document.addEventListener('mousemove', (e) => {
 });
 
 // ── Init ───────────────────────────────────────────────────────────────────────
-
+if (window.location.hash.includes('type=recovery') || window.location.search.includes('type=recovery')) {
+    window.location.replace('/reset-password' + window.location.hash + window.location.search);
+}
 document.addEventListener('DOMContentLoaded', () => {
 
     // ── Wire tab buttons (replaces onclick= in HTML) ──────────────────────────

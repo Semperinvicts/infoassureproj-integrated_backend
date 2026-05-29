@@ -213,21 +213,6 @@
 
 <div id="cursor"></div>
 <!--
-    FIX: EXTERNAL_SCRIPT_MISSING_INTEGRITY
-    ─────────────────────────────────────────────────────────────────────────────
-    hCaptcha's CDN (js.hcaptcha.com) does not publish SRI hashes — their CDN
-    serves dynamically built content, so a hash computed today would be invalid
-    tomorrow. We CANNOT add an integrity= attribute here.
-
-    The scanner's recommended remediation is to self-host the asset. We do this
-    by routing the script through our own Express server (/hcaptcha-api.js),
-    which fetches and caches the script from hCaptcha's CDN. Since the script
-    is now served from our own origin, browsers treat it as same-origin and SRI
-    is not required — the scanner finding disappears.
-
-    The query parameters (render=explicit, onload=onHcaptchaLoad) are still
-    present in the src URL — hCaptcha reads them from document.currentScript.src
-    regardless of whether the script is served from their domain or ours.
 -->
 <script src="https://js.hcaptcha.com/1/api.js?render=explicit&onload=onHcaptchaLoad" async defer></script>
 <script src="script.js"></script>
