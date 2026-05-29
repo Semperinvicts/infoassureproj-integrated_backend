@@ -10,7 +10,7 @@
 //   3. On submit, POSTs { token, password } to /reset-password.
 //   4. Transitions to success or surfaces a server error inline.
 
-(function initResetPassword() {
+(async function initResetPassword() {
 
     // ── Helpers ─────────────────────────────────────────────────────────────
     const STATE_IDS = ['stateLoading', 'stateError', 'stateForm', 'stateSuccess'];
