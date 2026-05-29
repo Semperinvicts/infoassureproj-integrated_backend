@@ -13,10 +13,14 @@
 (function initResetPassword() {
 
     // ── Helpers ─────────────────────────────────────────────────────────────
+    const STATE_IDS = ['stateLoading', 'stateError', 'stateForm', 'stateSuccess'];
+
     function show(id) {
-        ['stateLoading', 'stateError', 'stateForm', 'stateSuccess'].forEach((s) => {
+        STATE_IDS.forEach((s) => {
             const el = document.getElementById(s);
-            if (el) el.style.display = (s === id) ? '' : 'none';
+            if (!el) return;
+            // Toggle rp-hidden: remove it for the target state, add it for all others.
+            el.classList.toggle('rp-hidden', s !== id);
         });
     }
 
@@ -82,14 +86,14 @@
 
     function showError(msg) {
         if (!errMsg) return;
-        errMsg.textContent   = msg;
-        errMsg.style.display = 'block';
+        errMsg.textContent = msg;
+        errMsg.classList.remove('rp-hidden');
     }
 
     function clearError() {
         if (!errMsg) return;
-        errMsg.style.display = 'none';
-        errMsg.textContent   = '';
+        errMsg.classList.add('rp-hidden');
+        errMsg.textContent = '';
     }
 
     if (!form) return;
