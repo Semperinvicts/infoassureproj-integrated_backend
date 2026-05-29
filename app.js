@@ -718,16 +718,21 @@ app.post("/reset-password", resetPasswordLimiter, asyncHandler(async (req, res) 
     // Create a throw-away Supabase client authenticated as the recovering user.
     // This avoids requiring a service-role key while still being able to call
     // updateUser() in the correct user context.
-    const userClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-        global : { headers: { Authorization: `Bearer ${token}` } },
-        auth   : { persistSession: false }
+    const updateResp = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+        method: 'PUT',
+        headers: {
+            'apikey': SUPABASE_ANON_KEY,
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ password })
     });
 
-    const { error: updateError } = await userClient.auth.updateUser({ password });
-    if (updateError) {
-        console.error("[reset-password] Update failed:", updateError.message);
+    if (!updateResp.ok) {
+        const errData = await updateResp.json().catch(() => ({}));
+        console.error("[reset-password] Update failed:", errData);
         return res.status(400).json({
-            error: "Password update failed. The reset link may have already been used."
+            error: errData.msg || "Password update failed. The reset link may have expired."
         });
     }
 

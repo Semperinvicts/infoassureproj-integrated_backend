@@ -116,6 +116,7 @@
         if (!errMsg) return;
         errMsg.textContent = msg;
         errMsg.classList.remove('rp-hidden');
+        errMsg.style.display = 'block'; // <--- Add this to force visibility
     }
 
     function clearError() {
